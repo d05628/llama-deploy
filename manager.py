@@ -147,6 +147,7 @@ def default_config():
             "max_tokens": 2048,
         },
         "performance": {
+            "profile": "auto",
             "parallel": 1,
             "threads_batch": 0,   # 0 = run.py 自动计算（逻辑核数）
             "batch_size": 0,
@@ -156,11 +157,12 @@ def default_config():
             "priority_batch": 2,
             "cache_reuse": 512,
             "auto_gpu_layers": True,
-            "cache_type_k": "f16",
-            "cache_type_v": "f16",
+            "cache_type_k": "auto",
+            "cache_type_v": "auto",
             "spec_type": "off",
             "spec_draft_n_max": 3,
             "spec_draft_ngl": "auto",
+            "allow_experimental_mtp": False,
             "kv_unified": True,
             "ctx_checkpoints": 32,
             "cpu_moe": False,
@@ -2318,6 +2320,20 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">⚡ 高级性能</div>
         <div class="form-row">
           <div class="form-group">
+            <label class="form-label">性能策略</label>
+            <select class="form-input" id="cfg-performance_profile">
+              <option value="auto">自动适配</option>
+              <option value="maximum">极限性能</option>
+              <option value="compatible">兼容优先</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">GPU 预留显存 MB（0=自动）</label>
+            <input class="form-input" id="cfg-fit_target_mb" type="number" min="0" value="0">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
             <label class="form-label">Speculative / MTP</label>
             <select class="form-input" id="cfg-spec_type">
               <option value="off">关闭</option>
@@ -2334,13 +2350,13 @@ a{color:var(--primary);text-decoration:none}
           <div class="form-group">
             <label class="form-label">KV Cache K</label>
             <select class="form-input" id="cfg-cache_type_k">
-              <option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
+              <option value="auto">自动</option><option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
             </select>
           </div>
           <div class="form-group">
             <label class="form-label">KV Cache V</label>
             <select class="form-input" id="cfg-cache_type_v">
-              <option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
+              <option value="auto">自动</option><option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
             </select>
           </div>
         </div>
@@ -2940,7 +2956,8 @@ async function loadConfig(){
   setVal('cfg-temperature',sp.temperature);setVal('cfg-top_k',sp.top_k);
   setVal('cfg-top_p',sp.top_p);setVal('cfg-presence_penalty',sp.presence_penalty);
   setVal('cfg-spec_type',p.spec_type||'off');setVal('cfg-spec_draft_n_max',p.spec_draft_n_max!=null?p.spec_draft_n_max:3);
-  setVal('cfg-cache_type_k',p.cache_type_k||'f16');setVal('cfg-cache_type_v',p.cache_type_v||'f16');
+  setVal('cfg-performance_profile',p.profile||'auto');setVal('cfg-fit_target_mb',p.fit_target_mb!=null?p.fit_target_mb:0);
+  setVal('cfg-cache_type_k',p.cache_type_k||'auto');setVal('cfg-cache_type_v',p.cache_type_v||'auto');
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
   var bk=document.getElementById('cfg-gpu_backend');if(bk)bk.value=g.backend||'auto';
   var glVal=g.gpu_layers!=null?g.gpu_layers:-1;
@@ -2968,10 +2985,10 @@ function defaultCfg(){
       model_alias:'llama-deploy-local',api_key:'local-no-key-needed',claude_tool_mode:'repair',request_timeout:600},
     gpu:{backend:'auto',gpu_layers:-1,flash_attention:true},
     sampling:{temperature:0.7,top_k:20,top_p:0.8,presence_penalty:1.5,max_tokens:2048},
-    performance:{parallel:1,threads_batch:0,batch_size:0,ubatch_size:0,fit_target_mb:0,
+    performance:{profile:'auto',parallel:1,threads_batch:0,batch_size:0,ubatch_size:0,fit_target_mb:0,
       priority:2,priority_batch:2,cache_reuse:512,auto_gpu_layers:true,
-      cache_type_k:'f16',cache_type_v:'f16',spec_type:'off',spec_draft_n_max:3,
-      spec_draft_ngl:'auto',kv_unified:true,ctx_checkpoints:32,cpu_moe:false,n_cpu_moe:0},
+      cache_type_k:'auto',cache_type_v:'auto',spec_type:'off',spec_draft_n_max:3,
+      spec_draft_ngl:'auto',allow_experimental_mtp:false,kv_unified:true,ctx_checkpoints:32,cpu_moe:false,n_cpu_moe:0},
     build:{use_openblas:true,jobs:0},ui:{language:'zh',verbose:true}}
 }
 
@@ -2983,8 +3000,10 @@ async function saveConfig(){
   oldCompat.upstream_url='http://127.0.0.1:'+serverPort;
   oldPerf.spec_type=getVal('cfg-spec_type')||'off';
   oldPerf.spec_draft_n_max=getNum('cfg-spec_draft_n_max',3);
-  oldPerf.cache_type_k=getVal('cfg-cache_type_k')||'f16';
-  oldPerf.cache_type_v=getVal('cfg-cache_type_v')||'f16';
+  oldPerf.profile=getVal('cfg-performance_profile')||'auto';
+  oldPerf.fit_target_mb=getNum('cfg-fit_target_mb',0);
+  oldPerf.cache_type_k=getVal('cfg-cache_type_k')||'auto';
+  oldPerf.cache_type_v=getVal('cfg-cache_type_v')||'auto';
   oldPerf.n_cpu_moe=getNum('cfg-n_cpu_moe',0);
   oldPerf.kv_unified=document.getElementById('cfg-kv_unified').classList.contains('on');
   var cfg={

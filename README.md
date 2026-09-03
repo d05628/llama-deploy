@@ -202,19 +202,51 @@ Qwen3-VL-8B-Q4_K_M.mmproj-f16.gguf
 | `sampling.max_tokens` | 单次最大生成数 | `2048` |
 | `performance.spec_type` | speculative decoding（可手动设 `draft-mtp` 测 MTP/nextn 模型） | `off` |
 | `performance.spec_draft_n_max` | MTP 单步草稿 token 数 | `3` |
-| `performance.cache_type_k/v` | KV cache 类型（默认最稳，显式设 `q8_0`/`q4_0` 可省显存） | `f16` |
+| `performance.profile` | `auto` 自适应 / `maximum` 极限显存利用 / `compatible` 兼容优先 | `auto` |
+| `performance.cache_type_k/v` | KV cache 类型；`auto` 在显存高压或长上下文时自动采用 `q8_0` | `auto` |
 | `performance.batch_size` / `ubatch_size` | `0` 交给新版 llama.cpp 按设备自动拟合；非零为手动固定值 | `0` |
-| `performance.fit_target_mb` | 自动拟合后每张 GPU 预留显存；`0` 会按视觉模块大小动态计算 | `0` |
+| `performance.fit_target_mb` | 自动拟合后每张 GPU 预留显存；`0` 会按 GPU、模型和视觉模块动态计算 | `0` |
 
 ### 性能自适应
 
 - 生成线程使用实际物理核心，提示词批处理使用逻辑核心，兼顾单 token 延迟与提示词吞吐。
 - CUDA 会汇总多张 NVIDIA GPU 的可用显存；Apple Silicon 自动选 Metal；Windows 同时识别 Vulkan loader 与开发工具。
 - 新版 llama.cpp 支持时使用 `-ngl auto` 与 `--fit`，按启动时的实时空闲显存决定卸载，而不是绑定某台机器的层数。
-- Flash Attention、连续批处理、KV cache 复用和可用的 MTP 推测解码会按模型及当前二进制能力启用。
+- Flash Attention、连续批处理和 KV cache 复用会按能力启用；MTP 仅在用户显式请求且模型、当前二进制均支持时启用。
 - MoE GPU 层估算按完整常驻权重计算，避免把“每 token 激活参数少”误当成“显存只需相同比例”而导致 OOM。
+- 能读取 NVIDIA compute capability；RTX 50 / Blackwell 会采用更激进但仍由 `--fit` 保护的显存策略。源码构建检测到 CUDA Toolkit 12.8+ 时会生成 `sm_120` 原生架构。
 
 若追求单路输出速度，优先选择能完整放入显存的合适量化；`batch_size` 主要影响长提示词和并发吞吐，不会等比例提高逐 token 生成速度。
+
+### RTX 5060 Ti 16GB 与 Qwen3.8
+
+Qwen3.8-27B Q4_K_M 文件本身已非常接近 16GB 显存容量，Windows 桌面占用、CUDA 工作区和 KV cache 会使它通常无法 100% 常驻显存。本项目的 `auto` 策略会自动采用：
+
+- 单路 `parallel=1`、Flash Attention、`-ngl auto` 和实时显存拟合；
+- Q8 KV cache，把更多显存留给权重；
+- 约 384MB 的目标余量；Web 管理器选择“极限性能”后会尝试 256MB；
+- 物理核心负责逐 token 解码、逻辑核心负责提示词批处理。
+
+15+ token/s 是合理的调优目标，但并非固定保证：Q4_K_M 仍可能有少数层留在 CPU，最终速度很依赖 CPU、DDR5 带宽、当时空闲显存和上下文长度。若以吐字速度优先，约 14.6GB 的 IQ4_XS 或更小量化更容易全量放入 16GB 显存，往往比“量化稍高但跨 CPU/GPU”的组合更快。
+
+在目标电脑上先关闭占显存的软件，再运行：
+
+```powershell
+python run.py benchmark --sweep
+```
+
+结果中的 `tg128` 是单路生成速度。五组结果里选择能稳定完成且 `tg128` 最高的 `fit-target`，填入 Web 管理器的“GPU 预留显存”；如果 256/384MB OOM，就使用下一档。普通复测可运行 `python run.py benchmark`。
+
+Qwen3.8-Flash-Next 是总参数规模远大于 27B、每 token 只激活一部分参数的实验模型；“激活参数少”并不代表整个 GGUF 不需要装入内存。当前公开量化通常已超过这台机器 64GB RAM 的舒适容量，而且 llama.cpp 的 Flash-Next MTP 加速仍在实验阶段。因此本项目支持识别并启动兼容量化，但默认不启用其实验 MTP；在 5060 Ti 16GB + 64GB RAM 上不把它列为稳定高速目标。强行依赖页面文件可以启动某些超低量化，却通常会严重拖慢吐字。
+
+RTX 50 要获得原生 Blackwell 内核，优先安装最新 NVIDIA 驱动并使用更新器选出的最新兼容 CUDA 包：
+
+```powershell
+python deploy.py --upgrade-llama
+python run.py status
+```
+
+若更新器提示所选预编译包低于 CUDA 12.8，它仍可兼容运行，但没有 `sm_120` 原生构建优化；高级用户可安装 CUDA Toolkit 12.8+、CMake 和 Visual Studio C++ 工具链后运行 `python deploy.py --build-from-source`。该操作同样会先备份旧引擎，并在构建或验证失败时自动回滚。
 
 ### 下载配置
 

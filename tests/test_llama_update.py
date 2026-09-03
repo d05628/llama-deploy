@@ -45,6 +45,19 @@ class LlamaUpdateTests(unittest.TestCase):
         self.assertIn("cuda-12.4-x64", main["name"])
         self.assertIn("cuda-12.4-x64", runtime["name"])
 
+    def test_blackwell_driver_selects_newest_compatible_cuda_pair(self):
+        instance = self.make_deployer("cuda", "13.3")
+        instance.gpu_info["compute_capability"] = "12.0"
+        assets = [
+            asset("llama-b10717-bin-win-cuda-13.3-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.3-x64.zip"),
+            asset("llama-b10717-bin-win-cuda-12.4-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-12.4-x64.zip"),
+        ]
+        main, runtime = instance._find_best_asset(assets, announce=False)
+        self.assertIn("cuda-13.3-x64", main["name"])
+        self.assertIn("cuda-13.3-x64", runtime["name"])
+
     def test_incomplete_cuda_release_is_rejected(self):
         instance = self.make_deployer("cuda", "12.9")
         assets = [asset("llama-b10718-bin-win-cuda-12.4-x64.zip")]

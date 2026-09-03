@@ -46,6 +46,8 @@
     "max_tokens": 2048
   },
   "performance": {
+    // auto 会按 GPU/模型自适应；maximum 更激进；compatible 预留更多显存。
+    "profile": "auto",
     "parallel": 1,
     "threads_batch": 0,
     "batch_size": 0,
@@ -55,11 +57,12 @@
     "priority_batch": 2,
     "cache_reuse": 512,
     "auto_gpu_layers": true,
-    "cache_type_k": "f16",
-    "cache_type_v": "f16",
+    "cache_type_k": "auto",
+    "cache_type_v": "auto",
     "spec_type": "off",
     "spec_draft_n_max": 3,
     "spec_draft_ngl": "auto",
+    "allow_experimental_mtp": false,
     "kv_unified": true,
     "ctx_checkpoints": 32,
     "cpu_moe": false,

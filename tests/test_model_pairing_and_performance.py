@@ -78,6 +78,55 @@ class PerformanceDetectionTests(unittest.TestCase):
         self.assertEqual(result["vram_free_mb"], 18000)
         self.assertEqual(result["selected_backend"], "cuda")
 
+    def test_blackwell_compute_capability_is_detected(self):
+        gpu_output = "NVIDIA GeForce RTX 5060 Ti, 16311, 15500\n"
+        cap_output = "12.0\n"
+        responses = [
+            mock.Mock(returncode=0, stdout=gpu_output),
+            mock.Mock(returncode=0, stdout=cap_output),
+        ]
+        with mock.patch.object(run, "rc", side_effect=responses), mock.patch.object(
+            run, "has_vulkan", return_value=False
+        ):
+            result = run.accel("auto")
+        self.assertEqual(result["compute_capability"], "12.0")
+        self.assertTrue(run.is_blackwell(result))
+
+    def test_qwen38_27b_uses_16gb_high_pressure_profile(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 15500,
+            "compute_capability": "12.0",
+        }
+        meta = {"general.architecture": "qwen35", "block_count": 64}
+        with mock.patch.object(run, "model_size_mb", return_value=15.65 * 1024), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-Q4_K_M.gguf"), meta, gpu,
+                {"profile": "auto", "cache_type_k": "auto", "cache_type_v": "auto"},
+                8192,
+            )
+        self.assertEqual(tuning["fit_target_mb"], 384)
+        self.assertEqual(tuning["cache_type_k"], "q8_0")
+        self.assertEqual(tuning["cache_type_v"], "q8_0")
+
+    def test_explicit_cache_setting_overrides_profile(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 15500,
+            "compute_capability": "12.0",
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=15000), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-Q4_K_M.gguf"), {"block_count": 64}, gpu,
+                {"profile": "maximum", "cache_type_k": "f16", "cache_type_v": "q4_0"},
+                8192,
+            )
+        self.assertEqual(tuning["cache_type_k"], "f16")
+        self.assertEqual(tuning["cache_type_v"], "q4_0")
+        self.assertEqual(tuning["fit_target_mb"], 256)
+
     def test_moe_layer_estimate_uses_resident_weight_size(self):
         gpu = {"vram_free_mb": 6144}
         meta = {"general.architecture": "qwen3moe", "block_count": 40}

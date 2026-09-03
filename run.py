@@ -546,7 +546,7 @@ def has_vulkan() -> bool:
 
 
 def accel(preferred="auto") -> dict:
-    info = {"name": "", "gpu_count": 0, "vram_mb": 0, "vram_free_mb": 0, "available_backends": ["cpu"], "selected_backend": "cpu", "reason": ""}
+    info = {"name": "", "gpu_count": 0, "vram_mb": 0, "vram_free_mb": 0, "compute_capability": "", "available_backends": ["cpu"], "selected_backend": "cpu", "reason": ""}
     try:
         r = rc(["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"], 5)
         if r.returncode == 0 and r.stdout.strip():
@@ -568,6 +568,16 @@ def accel(preferred="auto") -> dict:
                     "vram_free_mb": sum(free_values),
                 })
             info["available_backends"].append("cuda")
+            cap_result = rc(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"], 5)
+            if cap_result.returncode == 0:
+                capabilities = [
+                    value.strip() for value in cap_result.stdout.splitlines()
+                    if re.fullmatch(r"\d+(?:\.\d+)?", value.strip())
+                ]
+                if capabilities:
+                    info["compute_capability"] = min(
+                        capabilities, key=lambda value: tuple(int(x) for x in value.split("."))
+                    )
     except Exception:
         pass
     if platform.system() == "Darwin":
@@ -586,6 +596,108 @@ def accel(preferred="auto") -> dict:
     else:
         info["reason"] = f"requested backend '{preferred}' is unavailable"
     return info
+
+
+def _version_tuple(value) -> tuple:
+    match = re.search(r"(\d+)(?:\.(\d+))?", str(value or ""))
+    return (int(match.group(1)), int(match.group(2) or 0)) if match else ()
+
+
+def is_blackwell(gpu: dict) -> bool:
+    return _version_tuple(gpu.get("compute_capability", "")) >= (12, 0)
+
+
+def model_identity(model_path: Path, meta: dict) -> str:
+    return " ".join(str(value).lower() for value in (
+        model_path.name if model_path else "",
+        meta.get("general.name", ""),
+        meta.get("general.basename", ""),
+        meta.get("general.architecture", ""),
+    ))
+
+
+def is_qwen38_flash_next(model_path: Path, meta: dict) -> bool:
+    identity = model_identity(model_path, meta)
+    arch = str(meta.get("general.architecture", "")).lower()
+    return arch.startswith("qwen4exp") or (
+        "qwen" in identity and "flash" in identity and "next" in identity
+    )
+
+
+def is_qwen38_dense_27b(model_path: Path, meta: dict) -> bool:
+    identity = model_identity(model_path, meta)
+    if is_qwen38_flash_next(model_path, meta):
+        return False
+    return (
+        "qwen3.8" in identity or "qwen3_8" in identity or "qwen38" in identity
+        or str(meta.get("general.architecture", "")).lower().startswith("qwen35")
+    ) and ("27b" in identity or int(meta.get("block_count") or 0) == 64)
+
+
+def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
+                       ctx_size: int, vision=False, mmproj_mb=0.0) -> dict:
+    """按模型和实际空闲显存生成可移植的单路推理参数。显式配置始终优先。"""
+    profile = str(pc.get("profile", "auto") or "auto").strip().lower()
+    if profile not in {"auto", "maximum", "compatible"}:
+        profile = "auto"
+    size_mb = model_size_mb(model_path)
+    total_mb = int(gpu.get("vram_mb", 0) or 0)
+    free_mb = int(gpu.get("vram_free_mb", 0) or total_mb)
+    cuda = gpu.get("selected_backend") == "cuda"
+    denominator = max(1, min(value for value in (total_mb, free_mb) if value > 0)) if (total_mb > 0 or free_mb > 0) else 1
+    pressure = size_mb / denominator if cuda else 0.0
+    dense_27b = is_qwen38_dense_27b(model_path, meta)
+    flash_next = is_qwen38_flash_next(model_path, meta)
+    notes = []
+
+    def cache_value(key):
+        configured = str(pc.get(key, "auto") or "auto").lower()
+        if configured != "auto":
+            return configured
+        if profile == "compatible" or not cuda:
+            return "f16"
+        # 高显存压力和长上下文使用 Q8 KV，把节省的空间让给模型层。
+        if profile == "maximum" or pressure >= 0.68 or ctx_size >= 8192:
+            return "q8_0"
+        return "f16"
+
+    configured_target = _safe_int(pc.get("fit_target_mb", 0), 0)
+    if configured_target:
+        fit_target = configured_target
+    elif not cuda:
+        fit_target = 0
+    elif vision:
+        fit_target = max(1024, min(4096, int(mmproj_mb * 1.1) + 512))
+    elif profile == "compatible":
+        fit_target = 1024
+    elif dense_27b and total_mb >= 15000:
+        fit_target = 256 if profile == "maximum" else 384
+        notes.append("Qwen3.8 27B / 16GB 显存高压模式：优先保留更多模型层在 GPU")
+    elif pressure >= 0.80:
+        fit_target = 384 if profile == "maximum" else 512
+    elif is_blackwell(gpu):
+        fit_target = 512 if profile == "maximum" else 768
+    else:
+        fit_target = 1024
+
+    available_memory_mb = float(meminfo().get("avail_gb", 0) or 0) * 1024 + free_mb
+    if flash_next and size_mb > available_memory_mb * 0.92:
+        notes.append(
+            f"Flash-Next GGUF 约 {size_mb / 1024:.1f}GB，已接近或超过当前 RAM+VRAM 可用容量；"
+            "即使能映射加载也可能频繁换页，无法获得理想吐字速度"
+        )
+    if is_blackwell(gpu):
+        notes.append(f"已启用 RTX 50 / Blackwell 自适应策略（compute capability {gpu.get('compute_capability')}）")
+
+    return {
+        "profile": profile,
+        "model_size_mb": size_mb,
+        "pressure": pressure,
+        "cache_type_k": cache_value("cache_type_k"),
+        "cache_type_v": cache_value("cache_type_v"),
+        "fit_target_mb": fit_target,
+        "notes": notes,
+    }
 
 
 def auto_layers(model_path: Path, gpu: dict, vision: bool, mmproj: Path, meta: dict) -> int:
@@ -738,6 +850,16 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         else:
             mmproj = None
 
+    mmproj_mb = 0.0
+    if vision and mmproj and mmproj.exists():
+        try:
+            mmproj_mb = mmproj.stat().st_size / (1024 * 1024)
+        except OSError:
+            pass
+    ctx_size = _safe_int(sc.get("ctx_size"), 2048)
+    tuning = performance_tuning(model, meta, gpu, pc, ctx_size, vision, mmproj_mb)
+    warn.extend(tuning["notes"])
+
     # ── 基础参数 ────────────────────────────────────────────────────────────
     args = [str(binary), "-m", str(model)]
     if supports(binary, "--jinja"):
@@ -783,6 +905,8 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
     if mode == "server" and spec_requested:
         if vision:
             warn.append("视觉模式下暂不启用 MTP speculative decoding，避免 multimodal slot/OOM 兼容问题")
+        elif is_qwen38_flash_next(model, meta) and not _config_bool(pc.get("allow_experimental_mtp", False)):
+            warn.append("Flash-Next 的 llama.cpp MTP 路径仍属实验实现；默认不启用，如需测试请显式设置 allow_experimental_mtp=true")
         elif spec_setting in ("auto", "true", "on", "1", "mtp", "draft-mtp"):
             if mtp_available and spec_mtp_supported:
                 spec_mtp_enabled = True
@@ -792,7 +916,7 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
             warn.append(f"未知 speculative 类型: {spec_setting}，已跳过")
 
     common += [
-        "--ctx-size",        str(_safe_int(sc.get("ctx_size"), 2048)),
+        "--ctx-size",        str(ctx_size),
         "--temp",            str(sp.get("temperature", 0.7)),
         "--top-k",           str(_safe_int(sp.get("top_k"), 20)),
         "--top-p",           str(sp.get("top_p", 0.8)),
@@ -830,10 +954,10 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         common.append("--no-kv-offload")
 
     # ── KV cache 类型 ───────────────────────────────────────────────────────
-    # 默认 f16 最稳。q8_0/q4_0 可省显存，有时提升长上下文吞吐，但部分新架构
-    # 组合（例如 GLM Flash + FA）可能不稳定，所以只在配置显式指定时启用。
-    cache_type_k = str(pc.get("cache_type_k", "f16") or "f16").lower()
-    cache_type_v = str(pc.get("cache_type_v", "f16") or "f16").lower()
+    # auto 会在模型挤压显存或长上下文时采用 q8_0，让更多权重驻留 GPU；
+    # explicit f16/q4 等设置仍完全尊重用户选择。
+    cache_type_k = tuning["cache_type_k"]
+    cache_type_v = tuning["cache_type_v"]
     allowed_cache_types = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
     if cache_type_k != "f16" and cache_type_k in allowed_cache_types and supports(binary, "--cache-type-k"):
         common += ["--cache-type-k", cache_type_k]
@@ -843,7 +967,6 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
     # ── RoPE 长上下文扩展 ────────────────────────────────────────────────────
     # ctx_size 超过模型原生上下文时，需要 RoPE scaling 防止位置编码崩溃。
     # yarn 是目前最主流的扩展方式（Qwen/LLaMA3 均支持）。
-    ctx_size   = _safe_int(sc.get("ctx_size"), 2048)
     native_ctx = _safe_int(meta.get("context_length", 0), 0)
     if native_ctx > 0 and ctx_size > native_ctx:
         rope_type = pc.get("rope_scaling", "yarn")   # 可选：yarn / linear
@@ -931,15 +1054,7 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
             if supports(binary, "--fit"):
                 args += ["--fit", "on"]
             if supports(binary, "--fit-target"):
-                configured_target = _safe_int(pc.get("fit_target_mb", 0), 0)
-                mmproj_reserve = 0
-                if vision and mmproj and mmproj.exists():
-                    try:
-                        mmproj_reserve = int(mmproj.stat().st_size / (1024 * 1024) * 1.1) + 512
-                    except OSError:
-                        pass
-                fit_target = configured_target or max(1024, min(4096, mmproj_reserve))
-                args += ["--fit-target", str(fit_target)]
+                args += ["--fit-target", str(tuning["fit_target_mb"])]
         else:
             layers = (
                 auto_layers(model, gpu, vision, mmproj, meta)
@@ -997,6 +1112,7 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         "mmproj": mmproj,
         "meta":   meta,
         "gpu":    gpu,
+        "tuning": tuning,
         "layers": layers,
         "warn":   warn,
         "host":   sc.get("host", "0.0.0.0"),
@@ -1015,7 +1131,14 @@ def summary(rt: dict, mode: str, vision: bool):
     else:
         msg = f"   后端: {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()}"
         if gpu.get("vram_free_mb", 0) > 0: msg += f" | 可用显存: {gpu['vram_free_mb']}MB"
+        if gpu.get("compute_capability"): msg += f" | CC {gpu['compute_capability']}"
         print(msg)
+    tuning = rt.get("tuning", {})
+    if tuning:
+        print(
+            f"   性能策略: {tuning.get('profile', 'auto')} | KV {tuning.get('cache_type_k')}/{tuning.get('cache_type_v')}"
+            f" | 显存余量 {tuning.get('fit_target_mb', 0)}MB"
+        )
     if rt["layers"] == -1: print("   GPU 卸载层数: auto")
     elif rt["layers"] > 0: print(f"   GPU 卸载层数: {rt['layers']}")
     if mode == "server": print(f"   服务模式: {'vision+text' if vision else 'text'} | http://{rt['host']}:{rt['port']}")
@@ -1214,7 +1337,9 @@ def cmd_status(cfg: dict) -> int:
     print(f"   内存:          total={mem.get('total_gb', 0)}GB avail={mem.get('avail_gb', 0)}GB")
     if meta: print(f"   模型元数据:    name={meta.get('general.name', 'unknown')}, arch={meta.get('general.architecture', 'unknown')}, blocks={meta.get('block_count', 'unknown')}, ctx={meta.get('context_length', 'unknown')}")
     if gpu.get("selected_backend") == "cpu": print(f"   GPU 后端:      CPU ({gc.get('backend', 'auto')})")
-    else: print(f"   GPU 后端:      {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()} | free={gpu.get('vram_free_mb', 0)}MB")
+    else:
+        capability = f" | CC={gpu['compute_capability']}" if gpu.get("compute_capability") else ""
+        print(f"   GPU 后端:      {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()} | free={gpu.get('vram_free_mb', 0)}MB{capability}")
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
         if pid_running(pid): print(f"   服务状态:      运行中 (PID: {pid})"); print(f"   地址:          http://localhost:{sc.get('port', 8080)}")
@@ -1229,6 +1354,53 @@ def cmd_status(cfg: dict) -> int:
     return 0
 
 
+def cmd_benchmark(cfg: dict, sweep=False) -> int:
+    """用 llama-bench 测量真实 prompt/decode 吞吐；sweep 比较不同显存余量。"""
+    mc, gc, sc, pc = (
+        cfg.get("model", {}), cfg.get("gpu", {}), cfg.get("server", {}),
+        cfg.get("performance", {}),
+    )
+    model = resolve_model(MODELS_DIR / mc.get("model_file", ""), mc)
+    if not model:
+        raise RuntimeError("未找到当前模型，请先在管理器中选择或下载模型")
+    binary = find_binary("llama-bench")
+    if not binary.exists():
+        raise RuntimeError("当前 llama.cpp 包缺少 llama-bench，请先运行 python deploy.py --upgrade-llama")
+
+    meta = gguf_meta(model)
+    gpu = accel(gc.get("backend", "auto"))
+    tuning = performance_tuning(
+        model, meta, gpu, pc, _safe_int(sc.get("ctx_size"), 8192), False, 0.0
+    )
+    fit_targets = (
+        "256,384,512,768,1024" if sweep and gpu.get("selected_backend") != "cpu"
+        else str(tuning["fit_target_mb"])
+    )
+    args = [
+        str(binary), "-m", str(model), "-p", "512", "-n", "128", "-r", "3",
+        "-t", str(physicalish_cpu_count()), "-b", "2048", "-ub", "512",
+        "-ctk", tuning["cache_type_k"], "-ctv", tuning["cache_type_v"],
+        "--prio", str(_safe_int(pc.get("priority", 2), 2)), "-o", "md", "--progress",
+    ]
+    if gpu.get("selected_backend") != "cpu":
+        args += ["-ngl", "-1", "-fa", "on", "--fit-target", fit_targets]
+
+    print("llama.cpp 本机性能基准")
+    print("-" * 50)
+    print(f"   模型: {model.name} ({tuning['model_size_mb'] / 1024:.1f}GB)")
+    print(f"   GPU: {gpu.get('name') or 'CPU'} | 可用显存 {gpu.get('vram_free_mb', 0)}MB")
+    print(f"   KV: {tuning['cache_type_k']}/{tuning['cache_type_v']} | fit-target: {fit_targets}MB")
+    print("   结果中 pp512 是提示词处理速度，tg128 是单路吐字速度（token/s）。")
+    if sweep:
+        print("   sweep 会比较 5 档显存余量；优先采用 tg128 最高且能稳定完成的档位。")
+    print("-" * 50)
+    try:
+        return subprocess.run(args, cwd=str(binary.parent)).returncode
+    except KeyboardInterrupt:
+        print("\n基准测试已中止")
+        return 130
+
+
 def print_help():
     print("""
 llama-deploy 管理工具
@@ -1240,6 +1412,8 @@ llama-deploy 管理工具
     python run.py server --background
     python run.py stop
     python run.py status
+    python run.py benchmark
+    python run.py benchmark --sweep
     python run.py help
 """)
 
@@ -1256,6 +1430,7 @@ def main() -> int:
         if args[0].lower() == "server": return cmd_server_background(cfg, "--vision" in args or "-v" in args) if ("--background" in args or "-bg" in args) else cmd_server(cfg, "--vision" in args or "-v" in args)
         if args[0].lower() == "stop": return cmd_stop()
         if args[0].lower() == "status": return cmd_status(cfg)
+        if args[0].lower() == "benchmark": return cmd_benchmark(cfg, "--sweep" in args)
         print(f"未知命令: {args[0]}"); print_help(); return 1
     except RuntimeError as e:
         print(str(e)); return 1

@@ -338,6 +338,7 @@ class GPUDetector:
             "nvidia_name": "",
             "nvidia_vram_mb": 0,
             "cuda_version": "",
+            "compute_capability": "",
             "cuda_available": False,
             "vulkan_available": False,
             "recommended_backend": "cpu",
@@ -385,6 +386,27 @@ class GPUDetector:
                     )
                     if version_match:
                         info["cuda_version"] = version_match.group(1)
+
+                    # RTX 50 / Blackwell 需要根据 compute capability 选择原生 CUDA 架构。
+                    # 独立查询以兼容不支持 compute_cap 字段的旧版 nvidia-smi。
+                    capability_result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+                        capture_output=True,
+                        timeout=10,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if capability_result.returncode == 0:
+                        capabilities = [
+                            value.strip()
+                            for value in capability_result.stdout.splitlines()
+                            if re.fullmatch(r"\d+(?:\.\d+)?", value.strip())
+                        ]
+                        if capabilities:
+                            # 异构多卡源码构建采用最低计算能力，避免生成部分设备不能加载的二进制。
+                            info["compute_capability"] = min(
+                                capabilities, key=lambda value: tuple(int(x) for x in value.split("."))
+                            )
         except FileNotFoundError:
             pass   # nvidia-smi 未安装，静默跳过
         except Exception:
@@ -692,7 +714,7 @@ class Downloader:
 class Deployer:
     """主部署类"""
 
-    def __init__(self, upgrade_llama: bool = False):
+    def __init__(self, upgrade_llama: bool = False, force_source: bool = False):
         # 加载配置
         if not CONFIG_FILE.exists():
             print(f"❌ 找不到配置文件: {CONFIG_FILE}")
@@ -706,6 +728,7 @@ class Deployer:
         self.sys = SystemInfo()
         self.dl = Downloader(self.config, self.p)
         self.upgrade_llama = upgrade_llama
+        self.force_source = force_source
         self.llama_backup_dir = None
         self.target_llama_tag = ""
 
@@ -811,6 +834,8 @@ class Deployer:
         if gpu["has_nvidia"]:
             print(f"   GPU: {gpu['nvidia_name']} ({gpu['nvidia_vram_mb']}MB)")
             print(f"   CUDA: ✅ 可用")
+            if gpu.get("compute_capability"):
+                print(f"   Compute Capability: {gpu['compute_capability']}")
         elif gpu["vulkan_available"]:
             print(f"   GPU: Vulkan 可用")
         else:
@@ -914,7 +939,7 @@ class Deployer:
                 )
             self._backup_llama_dir()
 
-        if self.sys.is_windows:
+        if self.sys.is_windows and not self.force_source:
             self._download_llama_windows()
         else:
             self._download_llama_source()
@@ -944,6 +969,17 @@ class Deployer:
         if self.target_llama_tag:
             print(f"   🎯 目标版本: {self.target_llama_tag}")
         main_asset, cudart_asset = self._find_best_asset(assets)
+
+        if main_asset and self.actual_backend == "cuda":
+            asset_cuda = re.search(r"cuda-(\d+(?:\.\d+)?)", str(main_asset.get("name", "")), re.I)
+            capability = self._version_tuple(self.gpu_info.get("compute_capability", ""))
+            selected_cuda = self._version_tuple(asset_cuda.group(1)) if asset_cuda else ()
+            if capability >= (12, 0) and selected_cuda and selected_cuda < (12, 8):
+                print(
+                    "   ⚠️  已检测到 RTX 50 / Blackwell，但当前驱动只允许选择 CUDA "
+                    f"{asset_cuda.group(1)} 预编译包；它可以运行，但不含 sm_120 原生优化。"
+                )
+                print("   💡 更新 NVIDIA 驱动，或安装 CUDA Toolkit 12.8+ 后运行 python deploy.py --build-from-source。")
 
         if not main_asset:
             missing = [name for name in ("git", "cmake") if not shutil.which(name)]
@@ -1222,6 +1258,11 @@ class Deployer:
             print(f"   🎯 选择后端: {backend.upper()} ({arch})")
         return (chosen, None)
 
+    @staticmethod
+    def _version_tuple(value) -> tuple:
+        match = re.search(r"(\d+)(?:\.(\d+))?", str(value or ""))
+        return (int(match.group(1)), int(match.group(2) or 0)) if match else ()
+
     def _check_existing_backend(self) -> bool:
         """检查已有的 llama.cpp 是否匹配所需后端（CUDA/Vulkan/CPU）"""
         if not self.server_bin.exists():
@@ -1454,6 +1495,33 @@ class Deployer:
 
         if backend == "cuda":
             cmake_args.append("-DGGML_CUDA=ON")
+            capability = self._version_tuple(self.gpu_info.get("compute_capability", ""))
+            nvcc_path = shutil.which("nvcc")
+            if not nvcc_path and os.environ.get("CUDA_PATH"):
+                candidate = Path(os.environ["CUDA_PATH"]) / "bin" / "nvcc.exe"
+                nvcc_path = str(candidate) if candidate.exists() else None
+            toolkit = ()
+            if nvcc_path:
+                try:
+                    nvcc_result = subprocess.run(
+                        [nvcc_path, "--version"], capture_output=True, timeout=10,
+                        encoding="utf-8", errors="replace",
+                    )
+                    version_match = re.search(r"release\s+(\d+(?:\.\d+)?)", nvcc_result.stdout, re.I)
+                    toolkit = self._version_tuple(version_match.group(1)) if version_match else ()
+                except Exception:
+                    pass
+            if capability >= (12, 0):
+                required = (12, 9) if capability >= (12, 1) else (12, 8)
+                arch = "121a-real" if capability >= (12, 1) else "120a-real"
+                if toolkit >= required:
+                    cmake_args += [f"-DCMAKE_CUDA_ARCHITECTURES={arch}", "-DGGML_NATIVE=ON"]
+                    print(f"   🚀 Blackwell 原生 CUDA 架构: {arch} (Toolkit {toolkit[0]}.{toolkit[1]})")
+                else:
+                    print(
+                        f"   ⚠️  Blackwell 原生构建需要 CUDA Toolkit {required[0]}.{required[1]}+；"
+                        "当前将使用 CMake 的兼容架构设置"
+                    )
             print(f"   🎯 编译后端: CUDA")
         elif backend == "vulkan":
             cmake_args.append("-DGGML_VULKAN=ON")
@@ -2004,8 +2072,9 @@ class Deployer:
 
 if __name__ == "__main__":
     try:
-        upgrade_llama = "--upgrade-llama" in sys.argv or "--update-llama" in sys.argv
-        deployer = Deployer(upgrade_llama=upgrade_llama)
+        force_source = "--build-from-source" in sys.argv
+        upgrade_llama = force_source or "--upgrade-llama" in sys.argv or "--update-llama" in sys.argv
+        deployer = Deployer(upgrade_llama=upgrade_llama, force_source=force_source)
         deployer.run()
     except KeyboardInterrupt:
         print("\n\n⏹️  用户取消")

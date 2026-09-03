@@ -106,7 +106,7 @@ class PerformanceDetectionTests(unittest.TestCase):
                 {"profile": "auto", "cache_type_k": "auto", "cache_type_v": "auto"},
                 8192,
             )
-        self.assertEqual(tuning["fit_target_mb"], 384)
+        self.assertEqual(tuning["fit_target_mb"], 256)
         self.assertEqual(tuning["cache_type_k"], "q8_0")
         self.assertEqual(tuning["cache_type_v"], "q8_0")
 
@@ -125,7 +125,103 @@ class PerformanceDetectionTests(unittest.TestCase):
             )
         self.assertEqual(tuning["cache_type_k"], "f16")
         self.assertEqual(tuning["cache_type_v"], "q4_0")
-        self.assertEqual(tuning["fit_target_mb"], 256)
+        # maximum 档把显存余量压到 64MiB：权重比显存大时，余量每多一点
+        # 就少一点权重驻留 GPU，实测 16GB 卡上比 256 快约 15%。
+        self.assertEqual(tuning["fit_target_mb"], 64)
+
+    def test_kv_estimate_honours_hybrid_attention_interval(self):
+        # qwen35 每 4 层才有 1 层全注意力，其余是常数大小的循环状态。
+        # 按 64 层全算会把 KV 高估 4 倍，进而误判上下文预算。
+        meta = {
+            "block_count": 65, "nextn_predict_layers": 1,
+            "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256,
+            "full_attention_interval": 4,
+        }
+        # 16 个注意力层 × 4 头 × (256+256) × 1.0625 字节 × 16384 token
+        self.assertAlmostEqual(run.kv_cache_mb(meta, 16384, "q8_0", "q8_0"), 544.0, places=1)
+        self.assertAlmostEqual(run.kv_cache_mb(meta, 16384, "q4_0", "q4_0"), 288.0, places=1)
+        dense = dict(meta, full_attention_interval=1)
+        self.assertAlmostEqual(run.kv_cache_mb(dense, 16384, "q8_0", "q8_0"), 544.0 * 4, places=1)
+
+    def test_kv_estimate_returns_zero_without_metadata(self):
+        self.assertEqual(run.kv_cache_mb({"block_count": 64}, 8192, "q8_0", "q8_0"), 0.0)
+
+    def test_oversized_weights_are_reported_as_the_real_bottleneck(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+            "compute_capability": "12.0",
+        }
+        meta = {
+            "general.architecture": "qwen35", "block_count": 65,
+            "nextn_predict_layers": 1, "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256,
+            "full_attention_interval": 4,
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=15701), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-Q4_K_M.gguf"), meta, gpu,
+                {"profile": "maximum", "cache_type_k": "q4_0", "cache_type_v": "q4_0"},
+                65536,
+            )
+        note = " ".join(tuning["notes"])
+        self.assertIn("超出可用显存", note)
+        self.assertIn("ctx_size=65536", note)
+
+    def test_no_free_vram_points_at_other_processes_not_at_the_quant(self):
+        # 显存被别的进程占满时，"换用 ≤0.0GB 的量化档位" 是无意义的建议
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 143,
+            "compute_capability": "12.0",
+        }
+        meta = {
+            "general.architecture": "qwen35", "block_count": 65,
+            "nextn_predict_layers": 1, "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256,
+            "full_attention_interval": 4,
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=15701), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-Q4_K_M.gguf"), meta, gpu,
+                {"profile": "maximum", "cache_type_k": "q4_0", "cache_type_v": "q4_0"},
+                16384,
+            )
+        note = " ".join(tuning["notes"])
+        self.assertIn("其它进程", note)
+        self.assertNotIn("量化档位", note)
+
+    def test_context_advisory_names_a_ctx_that_actually_fits(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+            "compute_capability": "12.0",
+        }
+        meta = {
+            "general.architecture": "qwen35", "block_count": 65,
+            "nextn_predict_layers": 1, "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256,
+            "full_attention_interval": 4,
+        }
+        # 权重装得下，但 65536 的 KV（2176MiB）会把它挤出去
+        with mock.patch.object(run, "model_size_mb", return_value=13500), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-IQ4_XS.gguf"), meta, gpu,
+                {"profile": "maximum", "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+                65536,
+            )
+        note = " ".join(tuning["notes"])
+        self.assertIn("建议 ctx_size", note)
+        advised = int(note.split("建议 ctx_size ≤")[1].split()[0])
+        self.assertLess(advised, 65536)
+        # 建议值必须真的装得下：权重 + 该上下文的 KV + 开销 ≤ 可用显存
+        self.assertLessEqual(
+            13500 + run.kv_cache_mb(meta, advised, "q8_0", "q8_0") + 600, 14919
+        )
 
     def test_moe_layer_estimate_uses_resident_weight_size(self):
         gpu = {"vram_free_mb": 6144}

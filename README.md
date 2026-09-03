@@ -32,6 +32,9 @@ llama-deploy/
 ├── manager.py        # Web 管理界面
 ├── uninstall.py      # 卸载工具
 ├── README.md         # 本文档
+├── CHANGELOG.md      # 更新日志
+├── docs/             # 文档
+│   └── performance-tuning.md  # 性能调优日志（含实测数据与无效路径）
 ├── llama.cpp/        # [自动下载] llama.cpp 引擎
 ├── models/           # [自动下载] 模型文件
 │   ├── *.gguf        # 模型本体
@@ -190,6 +193,11 @@ Qwen3-VL-8B-Q4_K_M.mmproj-f16.gguf
 | `server.ctx_size` | 上下文长度 | `8192` |
 | `server.enable_thinking` | 思考/推理模式 | `false` |
 | `server.reasoning_budget` | 思考 token 预算（`-1` 为不限制） | `512` |
+
+> 💡 **`ctx_size` 是显存吃紧时影响速度最大的参数。** 它决定 KV cache 占用，
+> 而 KV cache 每多占 1GB，就有若干层权重被挤到 CPU 上，吐字速度成倍下降。
+> 启动时如果看到显存预算警告，请优先调整它。实测数据与调优方法见
+> [性能调优日志](docs/performance-tuning.md)。
 
 ### 采样参数
 

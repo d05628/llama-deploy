@@ -235,6 +235,22 @@ def _skip(f, t):
         raise ValueError(f"bad gguf type {t}")
 
 
+# gguf_meta 按后缀提取的架构字段（去掉 "<arch>." 前缀后存一份短名）。
+# 注意力相关字段用于估算 KV cache 占用，full_attention_interval 是混合注意力
+# 模型（如 qwen35：每 4 层才有 1 层全注意力）的关键，缺了它会把 KV 高估数倍。
+META_SUFFIXES = (
+    ".block_count",
+    ".context_length",
+    ".embedding_length",
+    ".attention.head_count",
+    ".attention.head_count_kv",
+    ".attention.key_length",
+    ".attention.value_length",
+    ".full_attention_interval",
+    ".nextn_predict_layers",
+)
+
+
 def gguf_meta(model_path: Path) -> dict:
     key = str(model_path.resolve()) if model_path and model_path.exists() else str(model_path)
     if key in META_CACHE:
@@ -262,7 +278,7 @@ def gguf_meta(model_path: Path) -> dict:
             n_kv = _u64(f)
             for _ in range(n_kv):
                 k, t = _s(f), _u32(f)
-                if k in wanted or k.endswith(".block_count") or k.endswith(".context_length"):
+                if k in wanted or k.endswith(META_SUFFIXES):
                     meta[k] = _scalar(f, t)
                 else:
                     _skip(f, t)
@@ -280,6 +296,8 @@ def gguf_meta(model_path: Path) -> dict:
     if arch:
         meta["block_count"] = meta.get(f"{arch}.block_count", 0)
         meta["context_length"] = meta.get(f"{arch}.context_length", 0)
+        for suffix in META_SUFFIXES:
+            meta.setdefault(suffix.lstrip("."), meta.get(f"{arch}{suffix}", 0))
     META_CACHE[key] = meta
     return meta
 
@@ -634,6 +652,42 @@ def is_qwen38_dense_27b(model_path: Path, meta: dict) -> bool:
     ) and ("27b" in identity or int(meta.get("block_count") or 0) == 64)
 
 
+# 每个元素的字节数：q8_0 是 34 字节 / 32 个权重，q4_0 是 18 / 32，以此类推。
+_CACHE_TYPE_BYTES = {
+    "f32": 4.0, "f16": 2.0, "bf16": 2.0,
+    "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+    "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32,
+}
+
+
+def kv_cache_mb(meta: dict, ctx_size: int, cache_type_k: str, cache_type_v: str) -> float:
+    """估算 KV cache 显存占用（MiB）。元数据不全时返回 0，调用方据此跳过判断。"""
+    n_layer   = _safe_int(meta.get("block_count"), 0) - _safe_int(meta.get("nextn_predict_layers"), 0)
+    n_kv_head = _safe_int(meta.get("attention.head_count_kv"), 0)
+    k_len     = _safe_int(meta.get("attention.key_length"), 0)
+    v_len     = _safe_int(meta.get("attention.value_length"), 0)
+    if min(n_layer, n_kv_head, k_len, v_len, ctx_size) <= 0:
+        return 0.0
+    # 混合注意力模型每 interval 层才有一层带 KV，其余是常数大小的循环状态。
+    interval = max(1, _safe_int(meta.get("full_attention_interval"), 1))
+    attn_layers = max(1, n_layer // interval)
+    per_token = attn_layers * n_kv_head * (
+        k_len * _CACHE_TYPE_BYTES.get(cache_type_k, 2.0)
+        + v_len * _CACHE_TYPE_BYTES.get(cache_type_v, 2.0)
+    )
+    return per_token * ctx_size / (1024 * 1024)
+
+
+def max_ctx_for_vram(meta: dict, size_mb: float, free_mb: float,
+                     cache_type_k: str, cache_type_v: str, overhead_mb: float) -> int:
+    """返回权重仍能全部驻留显存的最大上下文长度；权重本身就装不下时返回 0。"""
+    per_token_mb = kv_cache_mb(meta, 1024, cache_type_k, cache_type_v) / 1024
+    budget = free_mb - size_mb - overhead_mb
+    if per_token_mb <= 0 or budget <= 0:
+        return 0
+    return int(budget / per_token_mb) // 1024 * 1024
+
+
 def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
                        ctx_size: int, vision=False, mmproj_mb=0.0) -> dict:
     """按模型和实际空闲显存生成可移植的单路推理参数。显式配置始终优先。"""
@@ -671,7 +725,9 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     elif profile == "compatible":
         fit_target = 1024
     elif dense_27b and total_mb >= 15000:
-        fit_target = 256 if profile == "maximum" else 384
+        # 权重比显存还大，留给驱动的余量每多 100MiB 就少一点权重驻留 GPU。
+        # 实测 16GB 卡上 64 比 256 快约 15%，代价是显存余量更紧。
+        fit_target = 64 if profile == "maximum" else 256
         notes.append("Qwen3.8 27B / 16GB 显存高压模式：优先保留更多模型层在 GPU")
     elif pressure >= 0.80:
         fit_target = 384 if profile == "maximum" else 512
@@ -686,6 +742,42 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
             f"Flash-Next GGUF 约 {size_mb / 1024:.1f}GB，已接近或超过当前 RAM+VRAM 可用容量；"
             "即使能映射加载也可能频繁换页，无法获得理想吐字速度"
         )
+    # ── 显存预算体检 ────────────────────────────────────────────────────────
+    # 权重装不下时 llama.cpp 会把层甩到 CPU，吐字速度会掉到原来的几分之一，
+    # 但过程里没有任何提示。这里按元数据把账算清楚，直接告诉用户瓶颈在哪。
+    kv_mb = kv_cache_mb(meta, ctx_size, cache_value("cache_type_k"), cache_value("cache_type_v"))
+    if cuda and free_mb > 0 and kv_mb > 0:
+        overhead_mb = 600.0          # 计算缓冲 + 循环状态 + CUDA context 的经验值
+        if size_mb + overhead_mb >= free_mb:
+            budget_gb = max(0.0, free_mb - overhead_mb - kv_mb) / 1024
+            head = (f"权重 {size_mb / 1024:.1f}GB 超出可用显存 {free_mb / 1024:.1f}GB，"
+                    f"必然有一部分层留在 CPU 上，这是吐字慢的主因；")
+            if budget_gb < 1.0:
+                # 空闲显存少到放不下任何模型，多半是别的进程占着，而不是模型选大了
+                notes.append(
+                    head + f"当前几乎没有空闲显存可用，请先确认是否有其它进程"
+                           f"（残留的 llama-server、浏览器硬件加速等）占用了显存"
+                )
+            else:
+                # 已经在用 4bit KV 时就别再建议换 KV 类型了
+                lever = ("调小 ctx_size"
+                         if _CACHE_TYPE_BYTES.get(cache_value("cache_type_k"), 2.0) <= 0.65
+                         else "调小 ctx_size 或改用 q4_0 KV")
+                notes.append(
+                    head + f"当前 ctx_size={ctx_size} 还要额外占用 {kv_mb:.0f}MiB KV cache，"
+                           f"{lever} 能把这部分显存让给权重。"
+                           f"若要让权重完整驻留显存，需换用体积 ≤{budget_gb:.1f}GB 的量化档位"
+                )
+        else:
+            max_ctx = max_ctx_for_vram(meta, size_mb, free_mb,
+                                       cache_value("cache_type_k"), cache_value("cache_type_v"),
+                                       overhead_mb)
+            if 0 < max_ctx < ctx_size:
+                notes.append(
+                    f"ctx_size={ctx_size} 需要 {kv_mb:.0f}MiB KV cache，加上权重会超出可用显存，"
+                    f"部分层会被挤到 CPU 上；当前显存下建议 ctx_size ≤{max_ctx}"
+                )
+
     if is_blackwell(gpu):
         notes.append(f"已启用 RTX 50 / Blackwell 自适应策略（compute capability {gpu.get('compute_capability')}）")
 

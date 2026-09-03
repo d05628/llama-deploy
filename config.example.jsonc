@@ -1,0 +1,76 @@
+{
+  // 在 Web 管理器中选择模型后，这些字段会自动写入本地 config.jsonc。
+  "model": {
+    "repo_id": "",
+    "model_file": "",
+    "mmproj_file": "",
+    "mmproj_use_xet": true,
+    "mmproj_map": {},
+    "mmproj_bindings": {}
+  },
+  "download": {
+    "hf_mirror": "https://hf-mirror.com",
+    // 可选；留空时使用 GitHub 官方直链，镜像失败也会自动回退直链。
+    "github_mirror": "",
+    "timeout": 300,
+    "retries": 3
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "threads": 0,
+    "ctx_size": 8192,
+    "enable_thinking": false,
+    "reasoning_budget": 512
+  },
+  "compat": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 11434,
+    "upstream_url": "http://127.0.0.1:8080",
+    "model_alias": "llama-deploy-local",
+    "api_key": "local-no-key-needed",
+    "claude_tool_mode": "repair",
+    "request_timeout": 600
+  },
+  "gpu": {
+    "backend": "auto",
+    "gpu_layers": -1,
+    "flash_attention": true
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_k": 20,
+    "top_p": 0.8,
+    "presence_penalty": 1.5,
+    "max_tokens": 2048
+  },
+  "performance": {
+    "parallel": 1,
+    "threads_batch": 0,
+    "batch_size": 0,
+    "ubatch_size": 0,
+    "fit_target_mb": 0,
+    "priority": 2,
+    "priority_batch": 2,
+    "cache_reuse": 512,
+    "auto_gpu_layers": true,
+    "cache_type_k": "f16",
+    "cache_type_v": "f16",
+    "spec_type": "off",
+    "spec_draft_n_max": 3,
+    "spec_draft_ngl": "auto",
+    "kv_unified": true,
+    "ctx_checkpoints": 32,
+    "cpu_moe": false,
+    "n_cpu_moe": 0
+  },
+  "build": {
+    "use_openblas": true,
+    "jobs": 0
+  },
+  "ui": {
+    "language": "zh",
+    "verbose": true
+  }
+}

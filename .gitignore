@@ -1,0 +1,57 @@
+# Local configuration and credentials
+config.jsonc
+.env
+.env.*
+!.env.example
+
+# Downloaded models and llama.cpp runtime
+models/
+llama.cpp/
+llama.cpp.backup-*/
+.hf-venv/
+.venv/
+venv/
+env/
+*.gguf
+*.safetensors
+*.exe
+*.dll
+*.so
+*.dylib
+llama-*.zip
+*.part
+*.bad-*
+
+# Private keys, local databases and generated artifacts
+*.pem
+*.p12
+*.pfx
+*.key
+*.sqlite
+*.sqlite3
+build/
+dist/
+tmp/
+temp/
+
+# Logs, PIDs and caches
+*.log
+log.txt
+*.pid
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local historical copies
+*备份*/
+v1无错副本备份/
+v2无错副本备份/
+v3正式版备用分块模型支持不完善视觉基地支持不够智能/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

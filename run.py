@@ -717,12 +717,12 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
         return "f16"
 
     configured_target = _safe_int(pc.get("fit_target_mb", 0), 0)
+    # 先算出"普通模式下会取多少"，视觉模式再覆盖。
+    # 保留这个值，是为了在视觉模式下能算清楚"关掉视觉能省多少显存"。
     if configured_target:
         fit_target = configured_target
     elif not cuda:
         fit_target = 0
-    elif vision:
-        fit_target = max(1024, min(4096, int(mmproj_mb * 1.1) + 512))
     elif profile == "compatible":
         fit_target = 1024
     elif dense_27b and total_mb >= 15000:
@@ -737,6 +737,11 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     else:
         fit_target = 1024
 
+    text_mode_fit_target = fit_target
+    if cuda and vision and not configured_target:
+        # 视觉编码器的中间张量峰值很高，要给它留出 mmproj 量级的余量
+        fit_target = max(1024, min(4096, int(mmproj_mb * 1.1) + 512))
+
     available_memory_mb = float(meminfo().get("avail_gb", 0) or 0) * 1024 + free_mb
     if flash_next and size_mb > available_memory_mb * 0.92:
         notes.append(
@@ -748,12 +753,35 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     # 但过程里没有任何提示。这里按元数据把账算清楚，直接告诉用户瓶颈在哪。
     kv_mb = kv_cache_mb(meta, ctx_size, cache_value("cache_type_k"), cache_value("cache_type_v"))
     if cuda and free_mb > 0 and kv_mb > 0:
-        overhead_mb = 600.0          # 计算缓冲 + 循环状态 + CUDA context 的经验值
-        if size_mb + overhead_mb >= free_mb:
-            budget_gb = max(0.0, free_mb - overhead_mb - kv_mb) / 1024
-            head = (f"权重 {size_mb / 1024:.1f}GB 超出可用显存 {free_mb / 1024:.1f}GB，"
+        # 计算缓冲 + 循环状态 + CUDA context 的经验值。视觉模式还要算上常驻显存的
+        # mmproj 权重，且 fit_target 会被抬到 mmproj 的量级，两项一起吃掉的显存
+        # 足以把本来装得下的模型重新挤回 CPU —— 这正是开视觉后吐字变慢的原因。
+        vision_mb = mmproj_mb if (vision and mmproj_mb > 0) else 0.0
+        overhead_mb = 600.0 + vision_mb
+        # llama.cpp 按 fit_target 保留一块显存不用，这部分不能算进权重预算
+        usable_mb = max(0.0, free_mb - fit_target)
+        vision_note = (
+            f"（视觉模块 {vision_mb:.0f}MiB + 预留 {fit_target}MiB；"
+            f"不需要图片理解时改用普通模式启动可显著提速）" if vision_mb else ""
+        )
+        if size_mb + overhead_mb >= usable_mb:
+            budget_gb = max(0.0, usable_mb - overhead_mb - kv_mb) / 1024
+            head = (f"权重 {size_mb / 1024:.1f}GB 超出可用显存 {usable_mb / 1024:.1f}GB，"
                     f"必然有一部分层留在 CPU 上，这是吐字慢的主因；")
-            if budget_gb < 1.0:
+            if vision_mb:
+                # 视觉模式下先看看关掉视觉是否就能装下——这是最省事的解法
+                text_usable = free_mb - text_mode_fit_target
+                fits_without_vision = size_mb + 600.0 + kv_mb <= text_usable
+                notes.append(
+                    f"视觉模式额外占用约 {vision_mb + fit_target:.0f}MiB 显存"
+                    + vision_note
+                    + ("；实测该模型在普通模式下可完整驻留显存，开视觉会把约 "
+                       f"{size_mb + overhead_mb - usable_mb:.0f}MiB 权重挤回 CPU"
+                       if fits_without_vision else
+                       f"；当前权重 {size_mb / 1024:.1f}GB 已超出视觉模式下的 "
+                       f"{usable_mb / 1024:.1f}GB 预算")
+                )
+            elif budget_gb < 1.0:
                 # 空闲显存少到放不下任何模型，多半是别的进程占着，而不是模型选大了
                 notes.append(
                     head + f"当前几乎没有空闲显存可用，请先确认是否有其它进程"
@@ -770,13 +798,14 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
                            f"若要让权重完整驻留显存，需换用体积 ≤{budget_gb:.1f}GB 的量化档位"
                 )
         else:
-            max_ctx = max_ctx_for_vram(meta, size_mb, free_mb,
+            max_ctx = max_ctx_for_vram(meta, size_mb, usable_mb,
                                        cache_value("cache_type_k"), cache_value("cache_type_v"),
                                        overhead_mb)
             if 0 < max_ctx < ctx_size:
                 notes.append(
                     f"ctx_size={ctx_size} 需要 {kv_mb:.0f}MiB KV cache，加上权重会超出可用显存，"
                     f"部分层会被挤到 CPU 上；当前显存下建议 ctx_size ≤{max_ctx}"
+                    + vision_note
                 )
 
     if is_blackwell(gpu):

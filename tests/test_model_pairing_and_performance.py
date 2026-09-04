@@ -379,6 +379,77 @@ class PerformanceDetectionTests(unittest.TestCase):
         self.assertIn("超出可用显存", note)
         self.assertIn("ctx_size=65536", note)
 
+    def _qwen38_meta(self):
+        return {
+            "general.architecture": "qwen35", "block_count": 65,
+            "nextn_predict_layers": 1, "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256,
+            "full_attention_interval": 4,
+        }
+
+    def test_vision_mode_reports_the_memory_it_costs(self):
+        # 视觉模式要常驻 mmproj 并抬高 fit_target，足以把本来装得下的权重挤回 CPU。
+        # 此前这段开销完全不参与预算计算，用户开了视觉只会觉得"莫名其妙变慢"。
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14849,
+            "compute_capability": "12.0",
+        }
+        params = {"profile": "maximum", "cache_type_k": "q4_0", "cache_type_v": "q4_0"}
+        with mock.patch.object(run, "model_size_mb", return_value=13590), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            without = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                params, 16384, vision=False, mmproj_mb=888,
+            )
+            with_vision = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                params, 16384, vision=True, mmproj_mb=888,
+            )
+        # 普通模式下这个模型装得下，不该有显存告警
+        self.assertNotIn("留在 CPU", " ".join(without["notes"]))
+        # 视觉模式下必须点明代价，并给出"改用普通模式"这个可执行建议
+        note = " ".join(with_vision["notes"])
+        self.assertIn("视觉模式", note)
+        self.assertIn("888", note)
+        self.assertIn("普通模式", note)
+
+    def test_vision_reserves_more_than_text_mode(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14849,
+            "compute_capability": "12.0",
+        }
+        params = {"profile": "maximum", "cache_type_k": "q4_0", "cache_type_v": "q4_0"}
+        with mock.patch.object(run, "model_size_mb", return_value=13590), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            text = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                params, 16384, vision=False, mmproj_mb=888,
+            )["fit_target_mb"]
+            vis = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                params, 16384, vision=True, mmproj_mb=888,
+            )["fit_target_mb"]
+        self.assertGreater(vis, text)
+        self.assertGreaterEqual(vis, 888)   # 至少要覆盖 mmproj 自身
+
+    def test_explicit_fit_target_still_wins_in_vision_mode(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14849,
+            "compute_capability": "12.0",
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=13590), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                {"profile": "maximum", "cache_type_k": "q4_0",
+                 "cache_type_v": "q4_0", "fit_target_mb": 333},
+                16384, vision=True, mmproj_mb=888,
+            )
+        self.assertEqual(tuning["fit_target_mb"], 333)
+
     def test_no_free_vram_points_at_other_processes_not_at_the_quant(self):
         # 显存被别的进程占满时，"换用 ≤0.0GB 的量化档位" 是无意义的建议
         gpu = {

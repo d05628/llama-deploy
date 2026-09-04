@@ -6,6 +6,7 @@ It exposes Ollama, Anthropic Messages, and OpenAI-compatible endpoints and
 forwards generation to the local llama.cpp OpenAI server.
 """
 import io
+import hmac
 import json
 import os
 import platform
@@ -58,6 +59,12 @@ def parse_jsonc(path: Path) -> dict:
 
 def load_config() -> dict:
     return parse_jsonc(CONFIG_FILE)
+
+
+# 这些取值表示"不启用鉴权"。此前 api_key 从配置读出来后从未被校验过，
+# 网关又默认监听 0.0.0.0，等于把模型直接暴露给整个局域网，
+# 而配置里那一行会让人误以为已经受保护。
+AUTH_DISABLED_VALUES = {"", "local-no-key-needed", "none", "disabled", "no-key"}
 
 
 def compat_config(cfg: dict) -> dict:
@@ -735,6 +742,33 @@ class CompatHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
 
+    # ── 鉴权 ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def auth_required(api_key: str) -> bool:
+        return str(api_key or "").strip().lower() not in AUTH_DISABLED_VALUES
+
+    def _presented_key(self) -> str:
+        """按 OpenAI / Anthropic / Ollama 各自的习惯取凭证。"""
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return (self.headers.get("X-Api-Key")
+                or self.headers.get("api-key")
+                or auth.strip())
+
+    def _authorized(self, cc: dict) -> bool:
+        if not self.auth_required(cc.get("api_key", "")):
+            return True
+        return hmac.compare_digest(self._presented_key(), str(cc["api_key"]))
+
+    def _deny(self):
+        self._send_json(
+            {"error": {"type": "authentication_error",
+                       "message": "缺少或错误的 API key；请在请求头带上 "
+                                  "Authorization: Bearer <compat.api_key>"}},
+            status=401,
+        )
+
     def _send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -937,6 +971,10 @@ class CompatHandler(BaseHTTPRequestHandler):
         cc = compat_config(cfg)
         path = urllib.parse.urlparse(self.path).path
         model = self._model_id(cfg)
+        # 健康探测不需要凭证：管理器要靠它判断网关是否在线。
+        if path not in ("/", "/health") and not self._authorized(cc):
+            self._deny()
+            return
         if path in ("/", "/health"):
             self._send_json({
                 "status": "ok",
@@ -976,6 +1014,9 @@ class CompatHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         cfg = load_config()
         cc = compat_config(cfg)
+        if not self._authorized(cc):
+            self._deny()
+            return
         path = urllib.parse.urlparse(self.path).path
         data = self._read_json()
         model = self._model_id(cfg)
@@ -1199,6 +1240,14 @@ def serve() -> int:
     print(f"llama-deploy compatibility gateway {VERSION}")
     print(f"listening: http://{cc['host']}:{cc['port']}")
     print(f"upstream:  {cc['upstream_url']}")
+    if CompatHandler.auth_required(cc["api_key"]):
+        print("auth:      已启用（请求需带 Authorization: Bearer <compat.api_key>）")
+    else:
+        print("auth:      未启用")
+        if cc["host"] not in ("127.0.0.1", "localhost", "::1"):
+            print("⚠️  网关监听非回环地址且未启用鉴权，局域网内任何设备都能调用本模型。")
+            print("    如需限制访问，请把 config.jsonc 的 compat.api_key 改成一个自定义密钥，")
+            print("    或把 compat.host 改为 127.0.0.1。")
     try:
         server.serve_forever()
     finally:

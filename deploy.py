@@ -1165,6 +1165,28 @@ class Deployer:
             print(f"   ⚠️  官方 Release feed 读取失败: {e}")
         return {}
 
+    @staticmethod
+    def _safe_extractall(archive: zipfile.ZipFile, dest_dir: Path):
+        """解压前逐条校验成员路径，防止 zip slip。
+
+        压缩包正常来自 GitHub Release，但 download.github_mirror 是用户可配置的
+        第三方镜像；带 "../" 条目的恶意包可以写到项目目录之外。
+        """
+        dest = dest_dir.resolve()
+        for info in archive.infolist():
+            name = info.filename
+            if not name:
+                continue
+            if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+                raise RuntimeError(f"压缩包含有非法路径条目，已中止: {name}")
+            target = (dest / name).resolve()
+            if target != dest and dest not in target.parents:
+                raise RuntimeError(f"压缩包条目会写到目标目录之外，已中止: {name}")
+            # 符号链接在 zip 里以特殊属性存储，解压后可指向任意位置
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise RuntimeError(f"压缩包含有符号链接条目，已中止: {name}")
+        archive.extractall(dest_dir)
+
     def _extract_zip_flat(self, zip_path: Path, dest_dir: Path):
         """解压 zip，将所有文件平铺到 dest_dir（不保留子目录结构）"""
         with zipfile.ZipFile(zip_path, 'r') as z:
@@ -1186,6 +1208,9 @@ class Deployer:
             return False
         digest = str(asset.get("digest") or "")
         if not digest.lower().startswith("sha256:"):
+            # Release feed 没给校验值：无法验证 ≠ 验证通过，至少要说出来
+            print(f"   ⚠️  {asset.get('name', '资产')} 未提供 sha256 校验值，"
+                  f"已跳过完整性校验")
             return True
         expected = digest.split(":", 1)[1].lower()
         hasher = hashlib.sha256()
@@ -1441,7 +1466,7 @@ class Deployer:
                 }
                 if len(roots) != 1:
                     raise RuntimeError("llama.cpp 源码压缩包目录结构异常")
-                archive.extractall(BASE_DIR)
+                self._safe_extractall(archive, BASE_DIR)
             extracted_dir = BASE_DIR / roots.pop()
             extracted_dir.rename(LLAMA_DIR)
             zip_path.unlink(missing_ok=True)

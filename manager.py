@@ -24,11 +24,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import hmac
 import http.server
 import ipaddress
 import json
 import csv
 import platform
+import secrets
 import re
 import signal
 import shutil
@@ -36,6 +38,7 @@ import socket
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,7 +49,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -56,6 +59,11 @@ LLAMA_DIR = BASE_DIR / "llama.cpp"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_PORT = 9090
 LLAMA_VERSION_CACHE = {"key": None, "value": None, "ts": 0.0}
+
+# 管理器可以启动/停止进程、改配置、删模型，因此每次启动生成一枚会话令牌，
+# 只随页面本体下发。同源脚本读得到，其它站点的脚本读不到，以此挡住 CSRF。
+SESSION_TOKEN = secrets.token_urlsafe(32)
+SERVER_HOST = "127.0.0.1"
 
 # ============================================================
 #  JSONC 解析器
@@ -173,23 +181,48 @@ def default_config():
     }
 
 
-def pid_running(pid: int) -> bool:
+def process_name(pid: int) -> str:
+    """返回该 PID 的进程名（取不到时返回空字符串）。"""
     try:
         if platform.system() == "Windows":
             r = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=5,
             )
-            return r.returncode == 0 and str(pid) in (r.stdout or "")
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return isinstance(sys.exc_info()[1], PermissionError)
+            if r.returncode != 0 or not (r.stdout or "").strip():
+                return ""
+            row = next(csv.reader(io.StringIO(r.stdout.strip())), [])
+            return (row[0] if row else "").strip('"')
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        return (r.stdout or "").strip()
     except Exception:
+        return ""
+
+
+def pid_running(pid: int, expect: str = "") -> bool:
+    """PID 是否存活。给了 expect 就同时核对进程名。
+
+    PID 会被系统回收复用。只判断"存在这个 PID"就去 taskkill /F，
+    在 PID 文件过期时会误杀一个毫不相干的进程。
+    """
+    if pid <= 0:
         return False
+    name = process_name(pid)
+    if not name:
+        # 取不到进程名（权限不足等），退回到仅判断存活
+        try:
+            if platform.system() == "Windows":
+                return False
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+    return expect.lower() in name.lower() if expect else True
 
 
 def running_llama_processes() -> list:
@@ -374,6 +407,22 @@ def detect_quant(filename: str) -> str:
         if quant.lower() in low:
             return quant
     return "unknown"
+
+
+def safe_model_name(filename: str) -> bool:
+    """文件名是否可以安全地当作 models/ 下的一个文件来处理。
+
+    除了路径分隔符和 ..，还要挡掉 glob 元字符：这些函数里用 rglob 查找时，
+    "*.gguf" 会被当成通配符匹配到任意模型。
+    """
+    name = str(filename or "")
+    if not name or name in (".", ".."):
+        return False
+    if any(sep in name for sep in ("/", "\\", "\0")) or ".." in name:
+        return False
+    if any(ch in name for ch in "*?[]"):
+        return False
+    return name == Path(name).name
 
 
 def model_family(name: str) -> str:
@@ -892,13 +941,13 @@ class ModelScopeSource(ModelSource):
                 v = item.get(k)
                 if v:
                     try: downloads = int(v); break
-                    except: pass
+                    except (TypeError, ValueError): pass
             likes = 0
             for k in ["Stars","stars","Likes","likes"]:
                 v = item.get(k)
                 if v:
                     try: likes = int(v); break
-                    except: pass
+                    except (TypeError, ValueError): pass
             tags = item.get("Tags") or item.get("tags") or []
             if not isinstance(tags, list): tags = []
             clean_tags = []
@@ -957,7 +1006,7 @@ class ModelScopeSource(ModelSource):
                 v = item.get(k)
                 if v:
                     try: size = int(v); break
-                    except: pass
+                    except (TypeError, ValueError): pass
             ram_est = round(size/(1024**3)*1.2+0.8, 1) if size else 0
             quant = detect_quant(fname)
             is_mmproj = "mmproj" in fname.lower()
@@ -1364,7 +1413,7 @@ class DeployManager:
                 pid_text = COMPAT_PID_FILE.read_text(encoding="utf-8").strip()
                 if pid_text.isdigit():
                     pid = int(pid_text)
-                    running = pid_running(pid)
+                    running = pid_running(pid, "python")
                 if not running:
                     COMPAT_PID_FILE.unlink(missing_ok=True)
             except Exception:
@@ -1494,7 +1543,7 @@ class DeployManager:
                 pid_text = PID_FILE.read_text(encoding="utf-8").strip()
                 if pid_text.isdigit():
                     pid = int(pid_text)
-                    running = pid_running(pid)
+                    running = pid_running(pid, "llama-server")
                 if not running:
                     PID_FILE.unlink(missing_ok=True)
             except Exception:
@@ -1594,18 +1643,20 @@ class DeployManager:
     def stop_server(self):
         killed = False
 
-        # 方法1：按 PID 文件杀
+        # 方法1：按 PID 文件杀。先确认这个 PID 确实还是 llama-server ——
+        # PID 会被系统复用，PID 文件过期时直接 kill 会打到无关进程上。
         if PID_FILE.exists():
             try:
                 pid = int(PID_FILE.read_text().strip())
-                if platform.system() == "Windows":
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                   capture_output=True)
-                else:
-                    os.kill(pid, signal.SIGTERM)
-                killed = True
-            except Exception:
-                pass
+                if pid_running(pid, "llama-server"):
+                    if platform.system() == "Windows":
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                       capture_output=True)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                    killed = True
+            except Exception as exc:
+                print(f"按 PID 停止失败: {exc}")
             PID_FILE.unlink(missing_ok=True)
 
         # 方法2：按进程名杀（确保彻底）
@@ -1682,11 +1733,18 @@ class ModelLibrary:
     @staticmethod
     def activate(filename: str, is_mmproj: bool = False) -> dict:
         """切换激活的模型，自动匹配 mmproj"""
+        filename = local_model_name(filename)
+        # 此前不做任何校验，可以把 model_file 写成任意字符串，
+        # 直到启动服务时才报错。
+        if not safe_model_name(filename):
+            return {"status": "error", "message": "非法文件名"}
+        if not any(f.name == filename for f in MODELS_DIR.rglob("*.gguf")):
+            return {"status": "error", "message": f"models/ 下找不到该文件: {filename}"}
+
         cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
         model_cfg = cfg.setdefault("model", {})
         mmproj_map = model_cfg.setdefault("mmproj_map", {})
         mmproj_bindings = model_cfg.setdefault("mmproj_bindings", {})
-        filename = local_model_name(filename)
 
         if is_mmproj:
             active_model = local_model_name(model_cfg.get("model_file", ""))
@@ -1748,18 +1806,25 @@ class ModelLibrary:
     @staticmethod
     def delete(filename: str) -> dict:
         """删除模型文件"""
-        # 安全检查
-        if ".." in filename or "/" in filename or "\\" in filename:
+        if not safe_model_name(filename):
             return {"status": "error", "message": "非法文件名"}
 
-        # 搜索文件
+        # 逐个比对文件名，不用 rglob：rglob 会把 * ? [] 当通配符解析，
+        # 传入 "*.gguf" 就会匹配到任意模型并删掉。
         found = None
-        for f in MODELS_DIR.rglob(filename):
-            found = f
-            break
+        for candidate in MODELS_DIR.rglob("*.gguf"):
+            if candidate.name == filename:
+                found = candidate
+                break
 
         if not found or not found.exists():
             return {"status": "error", "message": f"文件不存在: {filename}"}
+
+        # 确认解析后的真实路径仍在 models/ 内（防符号链接逃逸）
+        try:
+            found.resolve().relative_to(MODELS_DIR.resolve())
+        except ValueError:
+            return {"status": "error", "message": "拒绝删除 models/ 之外的文件"}
 
         # 不允许删除当前激活的模型
         cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else {}
@@ -1797,9 +1862,20 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
         params = dict(urllib.parse.parse_qsl(parsed.query))
 
         if path == "/" or path == "/index.html":
+            if not self._host_ok():
+                self._deny("Host 头不是本机地址")
+                return
             self._serve_html()
-        elif path == "/api/system":
+            return
+        if not self._authorized():
+            self._deny("缺少有效的管理器令牌，请从 http://localhost 页面操作")
+            return
+
+        if path == "/api/system":
             self._json_resp(get_system_info())
+        elif path == "/api/config/default":
+            # 前端不再自带一份默认值副本，统一以 default_config() 为准
+            self._json_resp(default_config())
         elif path == "/api/config":
             cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else {}
             self._json_resp(cfg)
@@ -1852,6 +1928,10 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             data = json.loads(body) if body.strip() else {}
         except json.JSONDecodeError:
             data = {}
+
+        if not self._authorized():
+            self._deny("缺少有效的管理器令牌，请从 http://localhost 页面操作")
+            return
 
         if path == "/api/config":
             save_config(data)
@@ -1994,26 +2074,60 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
     def do_OPTIONS(self):
+        # 管理界面与 API 同源，不需要跨域。此前发 Allow-Origin:* 且无鉴权，
+        # 等于允许任意网页读写本机管理器（读配置、改配置、删模型、启停进程）。
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+    # ── 访问控制 ─────────────────────────────────────────────────────────────
+    def _origin_ok(self) -> bool:
+        """拒绝跨站请求：浏览器无法伪造 Origin/Sec-Fetch-Site，据此挡掉 CSRF。"""
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "same-site", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            host = urllib.parse.urlparse(origin).netloc
+            if host and host != self.headers.get("Host"):
+                return False
+        return True
+
+    def _host_ok(self) -> bool:
+        """挡 DNS rebinding：只接受回环地址或本机实际网卡地址作为 Host。"""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if not host:
+            return True
+        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+        return host in set(get_lan_ips()) | {SERVER_HOST}
+
+    def _authorized(self) -> bool:
+        if not self._host_ok() or not self._origin_ok():
+            return False
+        # 页面加载时注入的一次性令牌；外站脚本读不到它，因此无法冒充。
+        token = self.headers.get("X-Manager-Token") or ""
+        return hmac.compare_digest(token, SESSION_TOKEN)
+
+    def _deny(self, reason: str):
+        self._json_resp({"status": "error", "message": f"拒绝访问：{reason}"}, status=403)
 
     def _json_resp(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_html(self):
-        html = HTML_PAGE.encode("utf-8")
+        # 令牌只随页面本体下发；同源脚本读得到，跨站脚本读不到。
+        html = HTML_PAGE.replace("__MANAGER_TOKEN__", SESSION_TOKEN).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", len(html))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(html)
 
@@ -2128,25 +2242,50 @@ a{color:var(--primary);text-decoration:none}
 .modal-overlay.show{display:flex}
 .modal-box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
            max-width:900px;width:100%;max-height:80vh;overflow:auto;padding:24px}
+/* 宽表格在窄屏必须能自己横向滚动，否则会把整页撑出横向滚动条 */
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.file-table{min-width:520px}
+
+@media(max-width:1024px){
+  .main{padding:20px 24px}
+}
 @media(max-width:768px){
   .sidebar{width:60px}.sidebar .nav-text,.sidebar .logo span{display:none}
-  .main{margin-left:60px;padding:16px}.form-row{grid-template-columns:1fr}.sys-info{display:none}
+  .main{margin-left:60px;padding:16px}
+  .form-row{grid-template-columns:1fr}
+  /* 此前这里是 .sys-info{display:none}：窄屏下把显存预算这类最该看的信息
+     整块藏掉了。改为收进侧栏底部之外单独成块，仍然可见。 */
+  .sys-info{position:static;padding:12px 16px;font-size:11px}
+}
+@media(max-width:560px){
+  /* 手机竖屏：侧栏变顶部横向导航，主内容整宽 */
+  .sidebar{position:static;width:100%;height:auto;border-right:none;
+    border-bottom:1px solid var(--border);display:flex;align-items:center;
+    overflow-x:auto;padding:0 8px}
+  .sidebar .logo{padding:10px 8px}
+  .sidebar .nav-item{white-space:nowrap;padding:10px 12px;flex:0 0 auto}
+  .sys-info{display:none}          /* 顶部横向导航里塞不下，系统页仍可查看 */
+  body{flex-direction:column}
+  .main{margin-left:0;padding:12px;max-width:100%}
+  .card{padding:14px}
+  .modal-content{width:96vw;max-height:88vh}
+  .btn{padding:8px 12px}
 }
 </style>
 </head>
 <body>
 <div class="app">
-  <nav class="sidebar">
+  <nav class="sidebar" role="tablist" aria-label="主导航">
     <div class="logo"><h1>🦙 <span>llama-deploy</span></h1><span>智能管理器</span></div>
-    <div class="nav-item active" onclick="switchPage('market',this)">
+    <div class="nav-item active" role="tab" tabindex="0" aria-selected="true" onclick="switchPage('market',this)">
       <span class="icon">🔍</span><span class="nav-text">模型市场</span></div>
-    <div class="nav-item" onclick="switchPage('library',this)">
+    <div class="nav-item" role="tab" tabindex="0" aria-selected="false" onclick="switchPage('library',this)">
       <span class="icon">📚</span><span class="nav-text">模型库</span></div>
-    <div class="nav-item" onclick="switchPage('config',this)">
+    <div class="nav-item" role="tab" tabindex="0" aria-selected="false" onclick="switchPage('config',this)">
       <span class="icon">⚙️</span><span class="nav-text">配置编辑</span></div>
-    <div class="nav-item" onclick="switchPage('deploy',this)">
+    <div class="nav-item" role="tab" tabindex="0" aria-selected="false" onclick="switchPage('deploy',this)">
       <span class="icon">🚀</span><span class="nav-text">部署管理</span></div>
-    <div class="nav-item" onclick="switchPage('system',this)">
+    <div class="nav-item" role="tab" tabindex="0" aria-selected="false" onclick="switchPage('system',this)">
       <span class="icon">📊</span><span class="nav-text">系统信息</span></div>
     <div class="sys-info" id="sidebarInfo"></div>
   </nav>
@@ -2242,16 +2381,16 @@ a{color:var(--primary);text-decoration:none}
       <div class="card">
         <div class="card-title">📦 模型配置</div>
         <div class="form-group">
-          <label class="form-label">仓库 ID (repo_id)</label>
+          <label class="form-label" for="cfg-repo_id">仓库 ID (repo_id)</label>
           <input class="form-input" id="cfg-repo_id" placeholder="例如：unsloth/Qwen3.5-0.8B-GGUF">
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">模型文件 (model_file)</label>
+            <label class="form-label" for="cfg-model_file">模型文件 (model_file)</label>
             <input class="form-input" id="cfg-model_file" placeholder="例如：Qwen3.5-0.8B-Q4_K_M.gguf">
           </div>
           <div class="form-group">
-            <label class="form-label">视觉模块 (mmproj_file)</label>
+            <label class="form-label" for="cfg-mmproj_file">视觉模块 (mmproj_file)</label>
             <input class="form-input" id="cfg-mmproj_file" placeholder="留空则不启用视觉功能">
           </div>
         </div>
@@ -2260,11 +2399,11 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🌐 下载配置</div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">HuggingFace 镜像</label>
+            <label class="form-label" for="cfg-hf_mirror">HuggingFace 镜像</label>
             <input class="form-input" id="cfg-hf_mirror" placeholder="https://hf-mirror.com">
           </div>
           <div class="form-group">
-            <label class="form-label">GitHub 镜像</label>
+            <label class="form-label" for="cfg-github_mirror">GitHub 镜像</label>
             <input class="form-input" id="cfg-github_mirror" placeholder="可选；留空使用 GitHub 官方直链">
           </div>
         </div>
@@ -2273,7 +2412,7 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🎮 GPU 配置</div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">计算后端</label>
+            <label class="form-label" for="cfg-gpu_backend">计算后端</label>
             <select class="form-input" id="cfg-gpu_backend">
               <option value="auto">auto — 自动检测（推荐）</option>
               <option value="cuda">cuda — NVIDIA CUDA</option>
@@ -2283,7 +2422,7 @@ a{color:var(--primary);text-decoration:none}
             <div class="form-hint">auto 自动检测：CUDA > Vulkan > CPU</div>
           </div>
           <div class="form-group">
-            <label class="form-label">GPU 卸载层数</label>
+            <label class="form-label" for="cfg-gpu_layers_preset">GPU 卸载层数</label>
             <select class="form-input" id="cfg-gpu_layers_preset" onchange="onGpuLayerPreset()">
               <option value="-1">🤖 自动（推荐）— 根据模型大小和显存自动计算</option>
               <option value="99">💪 全部卸载 — 强制全部放入 GPU（小模型用）</option>
@@ -2296,7 +2435,7 @@ a{color:var(--primary);text-decoration:none}
           </div>
         </div>
         <div class="form-group">
-          <label class="form-label">Flash Attention</label>
+          <label class="form-label" for="cfg-flash_attn">Flash Attention</label>
           <div class="form-toggle" onclick="toggleSwitch('cfg-flash_attn')">
             <div class="toggle-switch on" id="cfg-flash_attn"></div>
             <span>启用（减少显存占用，推荐开启）</span>
@@ -2309,27 +2448,27 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🖥️ 服务器配置</div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">监听端口</label>
+            <label class="form-label" for="cfg-port">监听端口</label>
             <input class="form-input" id="cfg-port" type="number" value="8080">
           </div>
           <div class="form-group">
-            <label class="form-label">CPU 线程数 (0=自动)</label>
+            <label class="form-label" for="cfg-threads">CPU 线程数 (0=自动)</label>
             <input class="form-input" id="cfg-threads" type="number" value="0">
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">上下文长度 (ctx_size)</label>
+            <label class="form-label" for="cfg-ctx_size">上下文长度 (ctx_size)</label>
             <input class="form-input" id="cfg-ctx_size" type="number" value="8192">
           </div>
           <div class="form-group">
-            <label class="form-label">思考预算 (tokens)</label>
+            <label class="form-label" for="cfg-reasoning_budget">思考预算 (tokens)</label>
             <input class="form-input" id="cfg-reasoning_budget" type="number" value="512">
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">思考模式</label>
+            <label class="form-label" for="cfg-thinking">思考模式</label>
             <div class="form-toggle" onclick="toggleSwitch('cfg-thinking')">
               <div class="toggle-switch" id="cfg-thinking"></div>
               <span>enable_thinking</span>
@@ -2341,21 +2480,21 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🎛️ 采样参数</div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">Temperature</label>
+            <label class="form-label" for="cfg-temperature">Temperature</label>
             <input class="form-input" id="cfg-temperature" type="number" step="0.1" value="0.7">
           </div>
           <div class="form-group">
-            <label class="form-label">Top-K</label>
+            <label class="form-label" for="cfg-top_k">Top-K</label>
             <input class="form-input" id="cfg-top_k" type="number" value="20">
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">Top-P</label>
+            <label class="form-label" for="cfg-top_p">Top-P</label>
             <input class="form-input" id="cfg-top_p" type="number" step="0.05" value="0.8">
           </div>
           <div class="form-group">
-            <label class="form-label">Presence Penalty</label>
+            <label class="form-label" for="cfg-presence_penalty">Presence Penalty</label>
             <input class="form-input" id="cfg-presence_penalty" type="number" step="0.1" value="1.5">
           </div>
         </div>
@@ -2364,7 +2503,7 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">⚡ 高级性能</div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">性能策略</label>
+            <label class="form-label" for="cfg-performance_profile">性能策略</label>
             <select class="form-input" id="cfg-performance_profile">
               <option value="auto">自动适配</option>
               <option value="maximum">极限性能</option>
@@ -2372,13 +2511,13 @@ a{color:var(--primary);text-decoration:none}
             </select>
           </div>
           <div class="form-group">
-            <label class="form-label">GPU 预留显存 MB（0=自动）</label>
+            <label class="form-label" for="cfg-fit_target_mb">GPU 预留显存 MB（0=自动）</label>
             <input class="form-input" id="cfg-fit_target_mb" type="number" min="0" value="0">
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">Speculative / MTP</label>
+            <label class="form-label" for="cfg-spec_type">Speculative / MTP</label>
             <select class="form-input" id="cfg-spec_type">
               <option value="off">关闭</option>
               <option value="draft-mtp">draft-mtp</option>
@@ -2386,19 +2525,19 @@ a{color:var(--primary);text-decoration:none}
             </select>
           </div>
           <div class="form-group">
-            <label class="form-label">MTP 草稿长度</label>
+            <label class="form-label" for="cfg-spec_draft_n_max">MTP 草稿长度</label>
             <input class="form-input" id="cfg-spec_draft_n_max" type="number" value="3">
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">KV Cache K</label>
+            <label class="form-label" for="cfg-cache_type_k">KV Cache K</label>
             <select class="form-input" id="cfg-cache_type_k">
               <option value="auto">自动</option><option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
             </select>
           </div>
           <div class="form-group">
-            <label class="form-label">KV Cache V</label>
+            <label class="form-label" for="cfg-cache_type_v">KV Cache V</label>
             <select class="form-input" id="cfg-cache_type_v">
               <option value="auto">自动</option><option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option><option value="q4_1">q4_1</option><option value="iq4_nl">iq4_nl</option>
             </select>
@@ -2406,11 +2545,11 @@ a{color:var(--primary);text-decoration:none}
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">前 N 层 MoE 放 CPU</label>
+            <label class="form-label" for="cfg-n_cpu_moe">前 N 层 MoE 放 CPU</label>
             <input class="form-input" id="cfg-n_cpu_moe" type="number" value="0">
           </div>
           <div class="form-group">
-            <label class="form-label">统一 KV</label>
+            <label class="form-label" for="cfg-kv_unified">统一 KV</label>
             <div class="form-toggle" onclick="toggleSwitch('cfg-kv_unified')">
               <div class="toggle-switch on" id="cfg-kv_unified"></div>
               <span>kv_unified</span>
@@ -2468,24 +2607,60 @@ a{color:var(--primary);text-decoration:none}
 
 <script>
 var sysInfo={},currentConfig={},logPollTimer=null,logLineCount=0;
+function stopLogPolling(){if(logPollTimer){clearInterval(logPollTimer);logPollTimer=null}}
 var deviceRec=null;   // /api/recommend 的结果，renderFiles 判定显存是否装得下时复用
 
+// 模型源返回的 id / 作者 / 文件名会被直接拼进 innerHTML。HuggingFace 官方
+// repo id 字符集受限，但管理器同时支持 ModelScope / Gitee / 用户可配置镜像，
+// 恶意或被劫持的源可借此注入脚本，故一律转义。
+function esc(v){
+  return String(v==null?'':v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// 供 onclick="fn(...)" 这类内联属性使用。属性值会先被 HTML 解码再当 JS 解析，
+// 所以必须先转成合法的 JS 字符串字面量（含引号），再做 HTML 属性转义。
+// 用 JSON.stringify 生成字面量，避免手写反斜杠转义出错。
+function escArg(v){
+  return esc(JSON.stringify(String(v==null?'':v)));
+}
+var MANAGER_TOKEN='__MANAGER_TOKEN__';
 async function api(url,method,body){
   try{
-    var opts={method:method||'GET',headers:{'Content-Type':'application/json'}};
+    var opts={method:method||'GET',headers:{
+      'Content-Type':'application/json',
+      'X-Manager-Token':MANAGER_TOKEN
+    },credentials:'same-origin'};
     if(body)opts.body=JSON.stringify(body);
     var r=await fetch(url,opts);
-    return await r.json();
+    var data;
+    try{ data=await r.json(); }catch(e){ data=null; }
+    // 此前只 return r.json()，从不看状态码：服务端返回 404/500 只要 body 是
+    // 合法 JSON 就会被当成正常数据继续渲染。
+    if(!r.ok){
+      var msg=(data&&(data.message||data.error))||('HTTP '+r.status+' '+r.statusText);
+      if(r.status===403) msg+='（请刷新页面重新获取管理器令牌）';
+      return {error:msg,status:r.status};
+    }
+    return data===null?{error:'服务端返回了非 JSON 内容'}:data;
   }catch(e){return{error:e.message}}
 }
 
 function switchPage(name,el){
   document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active')});
-  document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});
+  document.querySelectorAll('.nav-item').forEach(function(n){
+    n.classList.remove('active'); n.setAttribute('aria-selected','false');
+  });
   document.getElementById('page-'+name).classList.add('active');
-  if(el)el.classList.add('active');
+  if(el){el.classList.add('active'); el.setAttribute('aria-selected','true')}
   if(name==='library')refreshLibrary();
 }
+// 导航项加了 tabindex，就必须支持键盘激活，否则只能用鼠标
+document.addEventListener('keydown',function(e){
+  if(e.key!=='Enter'&&e.key!==' ')return;
+  var el=document.activeElement;
+  if(el&&el.classList&&el.classList.contains('nav-item')){e.preventDefault();el.click()}
+});
 
 function formatNum(n){if(!n)return'0';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
 
@@ -2524,6 +2699,7 @@ async function init(){
     '<div>💾 磁盘: '+sysInfo.disk_free_gb+'GB 可用</div>'+
     '<div>⚡ CPU: '+sysInfo.cpu_count+' 核</div>'+
     (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
+  await loadDefaultCfg();
   loadConfig();pollStatus();updateSystemPage();
   var vram=sysInfo.gpu_vram_mb||0;
   var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
@@ -2599,7 +2775,7 @@ async function doSearch(){
   var c = document.getElementById('searchResults');
   c.innerHTML = '<div class="empty"><div class="loading"></div><br>搜索中...</div>';
   var data = await api('/api/search?q='+encodeURIComponent(q)+'&source='+encodeURIComponent(source));
-  if(data.error){c.innerHTML='<div class="empty"><div class="icon">❌</div>'+data.error+'</div>';return}
+  if(data.error){c.innerHTML='<div class="empty"><div class="icon">❌</div>'+esc(data.error)+'</div>';return}
   var results = (data.results||[]).filter(function(m){
     return m&&m.id&&m.id!=='undefined'&&String(m.id).length>1;
   });
@@ -2611,8 +2787,6 @@ async function doSearch(){
   var srcForFiles = data.source || source;
   c.innerHTML = results.map(function(m){
     var id = m.id || '';
-    var escapedId = id.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    var escapedSrc = (srcForFiles||'').replace(/'/g,"\\'");
     // 提取关键标签：架构/大小/格式
     var keyTags = (m.tags||[]).filter(function(t){
       if(typeof t!=='string') return false;
@@ -2621,23 +2795,23 @@ async function doSearch(){
     }).slice(0,5);
     var tagHtml = keyTags.map(function(t){
       var cls = t==='gguf'?'tag-green':t.match(/^\d+b$/)?'tag-yellow':'tag-blue';
-      return '<span class="tag '+cls+'">'+t+'</span>';
+      return '<span class="tag '+cls+'">'+esc(t)+'</span>';
     }).join('');
     // 提取模型大小（从名字中匹配 7B/13B/70B 等）
     var sizeMatch = id.match(/[_\-](\d+\.?\d*[bBmMkK])[_\-\s.]/);
     var sizeTag = sizeMatch ? '<span class="tag tag-yellow">'+sizeMatch[1].toUpperCase()+'</span>' : '';
     // 发布者
     var author = m.author||id.split('/')[0]||'';
-    return '<div class="model-card" onclick="showFiles(\''+escapedId+'\',\''+escapedSrc+'\')">'+
+    return '<div class="model-card" onclick="showFiles('+escArg(id)+','+escArg(srcForFiles||'')+')">'+
       '<div class="name" style="display:flex;align-items:center;gap:8px">'+
-        '<span>'+id+'</span>'+sizeTag+
+        '<span>'+esc(id)+'</span>'+sizeTag+
       '</div>'+
       '<div class="meta">'+
-        (author?'<span>👤 '+author+'</span>':'')+
+        (author?'<span>👤 '+esc(author)+'</span>':'')+
         '<span>⬇️ '+formatNum(m.downloads||0)+'</span>'+
         '<span>❤️ '+formatNum(m.likes||0)+'</span>'+
-        (m.updated?'<span>📅 '+(m.updated||'').slice(0,10)+'</span>':'')+
-        '<span style="color:var(--text3)">📦 '+(m.source||srcForFiles)+'</span>'+
+        (m.updated?'<span>📅 '+esc(String(m.updated||'').slice(0,10))+'</span>':'')+
+        '<span style="color:var(--text3)">📦 '+esc(m.source||srcForFiles)+'</span>'+
       '</div>'+
       '<div class="tags">'+tagHtml+'</div>'+
     '</div>';
@@ -2769,7 +2943,7 @@ function renderFiles(files){
           ' style="margin-top:4px;width:16px;height:16px;cursor:pointer;flex-shrink:0">'+
         '<div style="flex:1;min-width:0">'+
           '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'+
-            '<span style="font-weight:600;word-break:break-all">'+(f.is_shard?'📦 ':'📄 ')+f.filename+'</span>'+
+            '<span style="font-weight:600;word-break:break-all">'+(f.is_shard?'📦 ':'📄 ')+esc(f.filename)+'</span>'+
             (f.is_mmproj?'<span class="tag tag-blue">视觉模块</span>':'')+
           '</div>'+
           '<div class="meta" style="margin-top:4px">'+
@@ -2778,9 +2952,9 @@ function renderFiles(files){
             (f.shard_count&&f.shard_count>1?'<span>🔀 '+f.shard_count+' 分片</span>':'')+
           '</div>'+
           '<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">'+
-            '<span class="tag '+qColor+'" title="'+qTip+'">'+f.quant+'</span>'+
+            '<span class="tag '+qColor+'" title="'+esc(qTip)+'">'+esc(f.quant)+'</span>'+
             compat+
-            (f.quant&&QUANT_TIP[f.quant]?'<span style="font-size:11px;color:var(--text3)">'+qTip+'</span>':'')+
+            (f.quant&&QUANT_TIP[f.quant]?'<span style="font-size:11px;color:var(--text3)">'+esc(qTip)+'</span>':'')+
           '</div>'+
         '</div>'+
       '</div>'+
@@ -2840,7 +3014,7 @@ function clearSelection(){
 }
 
 async function confirmMultiSelect(){
-  if(!_selectedMain && !_selectedMmproj){alert('请先勾选文件');return;}
+  if(!_selectedMain && !_selectedMmproj){showToast('请先勾选文件', 5000);return;}
   var names = [_selectedMain&&_selectedMain.filename, _selectedMmproj&&_selectedMmproj.filename].filter(Boolean);
   await applySelectedFilesForDeploy();
   closeFileModal();
@@ -2968,6 +3142,7 @@ async function selectFile(repoId, fileObj, source, skipClose){
 function showToast(msg, duration){
   var t = document.getElementById('toast');
   if(!t){ t=document.createElement('div'); t.id='toast';
+    t.setAttribute('role','status'); t.setAttribute('aria-live','polite');
     t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);'+
       'background:var(--bg3);border:1px solid var(--border);color:var(--text);'+
       'padding:10px 20px;border-radius:8px;font-size:13px;z-index:9999;max-width:80vw;text-align:center';
@@ -2989,31 +3164,29 @@ async function refreshLibrary(){
   }
   var mainModels=models.filter(function(m){return !m.is_mmproj});
   var visionModels=models.filter(function(m){return m.is_mmproj});
-  var html='<table class="file-table"><thead><tr><th>模型</th><th>量化</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+  var html='<div class="table-scroll"><table class="file-table"><thead><tr><th>模型</th><th>量化</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>';
   mainModels.forEach(function(m){
-    var ef=m.filename.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    html+='<tr><td><div style="font-weight:500">'+m.filename+'</div>'+
-      '<div style="font-size:11px;color:var(--text3)">'+m.path+'</div></td>'+
-      '<td><span class="tag tag-blue">'+m.quant+'</span></td>'+
+    html+='<tr><td><div style="font-weight:500">'+esc(m.filename)+'</div>'+
+      '<div style="font-size:11px;color:var(--text3)">'+esc(m.path)+'</div></td>'+
+      '<td><span class="tag tag-blue">'+esc(m.quant)+'</span></td>'+
       '<td>'+(m.size_mb>1024?m.size_gb+' GB':m.size_mb+' MB')+'</td>'+
       '<td>'+(m.is_active?'<span class="tag tag-green">🟢 使用中</span>':'<span class="tag tag-yellow">待命</span>')+'</td>'+
       '<td style="white-space:nowrap">'+(m.is_active?'<span style="font-size:12px;color:var(--text3)">当前模型</span>':
-      '<button class="btn btn-primary btn-sm" onclick="activateModel(\''+ef+'\',false)">激活</button> '+
-      '<button class="btn btn-danger btn-sm" onclick="deleteModel(\''+ef+'\')">删除</button>')+'</td></tr>';
+      '<button class="btn btn-primary btn-sm" onclick="activateModel('+escArg(m.filename)+',false)">激活</button> '+
+      '<button class="btn btn-danger btn-sm" onclick="deleteModel('+escArg(m.filename)+')">删除</button>')+'</td></tr>';
   });
-  html+='</tbody></table>';
+  html+='</tbody></table></div>';
   if(visionModels.length){
     html+='<div class="card-title" style="margin-top:16px">🔭 视觉模块</div>';
-    html+='<table class="file-table"><thead><tr><th>文件</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    html+='<div class="table-scroll"><table class="file-table"><thead><tr><th>文件</th><th>大小</th><th>状态</th><th>操作</th></tr></thead><tbody>';
     visionModels.forEach(function(m){
-      var ef=m.filename.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-      html+='<tr><td>'+m.filename+'</td>'+
+      html+='<tr><td>'+esc(m.filename)+'</td>'+
         '<td>'+(m.size_mb>1024?m.size_gb+' GB':m.size_mb+' MB')+'</td>'+
         '<td>'+(m.is_active?'<span class="tag tag-green">🟢 使用中</span>':'<span class="tag tag-yellow">待命</span>')+'</td>'+
         '<td>'+(m.is_active?'<span style="font-size:12px;color:var(--text3)">当前模块</span>':
-        '<button class="btn btn-primary btn-sm" onclick="activateModel(\''+ef+'\',true)">激活</button>')+'</td></tr>';
+        '<button class="btn btn-primary btn-sm" onclick="activateModel('+escArg(m.filename)+',true)">激活</button>')+'</td></tr>';
     });
-    html+='</tbody></table>';
+    html+='</tbody></table></div>';
   }
   el.innerHTML=html;
 }
@@ -3021,14 +3194,14 @@ async function refreshLibrary(){
 async function activateModel(filename,isMmproj){
   if(!confirm('切换为: '+filename+' ？\n需重启服务器生效'))return;
   var r=await api('/api/models/activate','POST',{filename:filename,is_mmproj:isMmproj});
-  alert((r&&r.message)?r.message:'完成');
+  showToast((r&&r.message)?r.message:'完成');
   refreshLibrary();loadConfig();
 }
 
 async function deleteModel(filename){
   if(!confirm('⚠️ 确定删除 '+filename+' ？\n不可恢复！'))return;
   var r=await api('/api/models/delete','POST',{filename:filename});
-  alert((r&&r.message)?r.message:'完成');
+  showToast((r&&r.message)?r.message:'完成');
   refreshLibrary();
 }
 
@@ -3067,19 +3240,19 @@ async function loadConfig(){
   if(kvu){if(p.kv_unified!==false)kvu.classList.add('on');else kvu.classList.remove('on')}
 }
 
+// 默认配置只有一个来源：后端的 default_config()。
+// 此前这里维护着第二份副本，与 Python 端和 config.example.jsonc 三份并存，
+// 加字段漏改一处就会静默漂移。启动时拉取一次并缓存。
+var _defaultCfg=null;
+async function loadDefaultCfg(){
+  if(_defaultCfg) return _defaultCfg;
+  var d=await api('/api/config/default');
+  if(d&&!d.error&&d.model) _defaultCfg=d;
+  return _defaultCfg||{};
+}
 function defaultCfg(){
-  return{model:{repo_id:'',model_file:'',mmproj_file:'',mmproj_use_xet:true,mmproj_map:{}},
-    download:{hf_mirror:'https://hf-mirror.com',github_mirror:'',timeout:300,retries:3},
-    server:{host:'0.0.0.0',port:8080,threads:0,ctx_size:8192,enable_thinking:false,reasoning_budget:512},
-    compat:{enabled:true,host:'0.0.0.0',port:11434,upstream_url:'http://127.0.0.1:8080',
-      model_alias:'llama-deploy-local',api_key:'local-no-key-needed',claude_tool_mode:'repair',request_timeout:600},
-    gpu:{backend:'auto',gpu_layers:-1,flash_attention:true},
-    sampling:{temperature:0.7,top_k:20,top_p:0.8,presence_penalty:1.5,max_tokens:2048},
-    performance:{profile:'auto',parallel:1,threads_batch:0,batch_size:0,ubatch_size:0,fit_target_mb:0,
-      priority:2,priority_batch:2,cache_reuse:512,auto_gpu_layers:true,
-      cache_type_k:'auto',cache_type_v:'auto',spec_type:'off',spec_draft_n_max:3,
-      spec_draft_ngl:'auto',allow_experimental_mtp:false,kv_unified:true,ctx_checkpoints:32,cpu_moe:false,n_cpu_moe:0},
-    build:{use_openblas:true,jobs:0},ui:{language:'zh',verbose:true}}
+  // 返回深拷贝，避免调用方就地修改污染缓存
+  return _defaultCfg?JSON.parse(JSON.stringify(_defaultCfg)):{};
 }
 
 async function saveConfig(){
@@ -3116,7 +3289,7 @@ async function saveConfig(){
     build:{use_openblas:true,jobs:0},ui:{language:'zh',verbose:true}
   };
   var r=await api('/api/config','POST',cfg);
-  alert((r&&r.message)?r.message:'已保存');
+  showToast((r&&r.message)?r.message:'已保存');
 }
 
 function resetConfig(){if(confirm('确定恢复默认配置？')){currentConfig=defaultCfg();loadConfig()}}
@@ -3130,14 +3303,14 @@ async function startDeploy(){
     closeFileModal();
   }
   var cfg=await api('/api/config');
-  if(!cfg.model||!cfg.model.model_file){alert('⚠️ 请先选择模型');return}
+  if(!cfg.model||!cfg.model.model_file){showToast('⚠️ 请先选择模型', 5000);return}
   if(!confirm('开始部署？'))return;
   document.getElementById('btnDeploy').disabled=true;
   var up=document.getElementById('btnUpgradeLlama');if(up)up.disabled=true;
   logLineCount=0;document.getElementById('deployLog').textContent='🚀 开始部署...\n';
   var r=await api('/api/deploy','POST');
   if(r&&r.status==='error'){
-    alert(r.message||'启动部署失败');
+    showToast(r.message||'启动部署失败', 8000);
     document.getElementById('btnDeploy').disabled=false;
     if(up)up.disabled=false;
     return;
@@ -3147,13 +3320,13 @@ async function startDeploy(){
 
 async function upgradeLlama(){
   var st=await api('/api/status');
-  if(st&&st.server_running){alert('请先停止服务器，再升级 llama.cpp');return}
+  if(st&&st.server_running){showToast('请先停止服务器，再升级 llama.cpp', 6000);return}
   if(!confirm('升级 llama.cpp 到最新可用版本？\n失败时会自动回滚到当前版本。'))return;
   document.getElementById('btnUpgradeLlama').disabled=true;
   logLineCount=0;document.getElementById('deployLog').textContent='⬆️ 开始升级 llama.cpp...\n';
   var r=await api('/api/llama/update','POST');
   if(r&&r.status==='error'){
-    alert(r.message||'启动升级失败');
+    showToast(r.message||'启动升级失败', 8000);
     document.getElementById('btnUpgradeLlama').disabled=false;
     return;
   }
@@ -3185,32 +3358,32 @@ function startLogPoll(){
 
 async function startServer(vision){
   var r=await api('/api/server/start','POST',{vision:vision});
-  alert((r&&r.message)?r.message:'操作完成');setTimeout(pollStatus,2000);
+  showToast((r&&r.message)?r.message:'操作完成');setTimeout(pollStatus,2000);
 }
 async function stopServer(){
   var r=await api('/api/server/stop','POST');
-  alert((r&&r.message)?r.message:'操作完成');setTimeout(pollStatus,1000);
+  showToast((r&&r.message)?r.message:'操作完成');setTimeout(pollStatus,1000);
 }
 
 async function publishLan(){
   var r=await api('/api/lan/publish','POST',{});
-  alert((r&&r.message)?r.message:'操作完成');
+  showToast((r&&r.message)?r.message:'操作完成');
   setTimeout(pollStatus,1200);
 }
 async function startGateway(){
   var r=await api('/api/gateway/start','POST',{});
-  alert((r&&r.message)?r.message:'操作完成');
+  showToast((r&&r.message)?r.message:'操作完成');
   setTimeout(pollStatus,1000);
 }
 async function stopGateway(){
   var r=await api('/api/gateway/stop','POST',{});
-  alert((r&&r.message)?r.message:'操作完成');
+  showToast((r&&r.message)?r.message:'操作完成');
   setTimeout(pollStatus,1000);
 }
 async function openFirewall(){
   if(!confirm('将尝试放行 llama-deploy 的服务端口和兼容网关端口。Windows 可能需要管理员权限，是否继续？'))return;
   var r=await api('/api/lan/firewall','POST',{});
-  alert((r&&r.message)?r.message:'操作完成');
+  showToast((r&&r.message)?r.message:'操作完成');
 }
 
 function renderLan(st){
@@ -3299,7 +3472,20 @@ async function updateSystemPage(){
     '</div></div>';
 }
 
-init();setInterval(pollStatus,10000);
+// 页面切到后台时暂停轮询：此前 setInterval 从不清理，隐藏时仍在持续请求。
+var statusTimer=null;
+function startStatusPolling(){
+  if(statusTimer) return;
+  statusTimer=setInterval(pollStatus,10000);
+}
+function stopStatusPolling(){
+  if(statusTimer){clearInterval(statusTimer);statusTimer=null}
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){stopStatusPolling()}else{pollStatus();startStatusPolling()}
+});
+window.addEventListener('beforeunload',function(){stopStatusPolling();stopLogPolling()});
+init();startStatusPolling();
 </script>
 </body>
 </html>"""
@@ -3310,6 +3496,7 @@ init();setInterval(pollStatus,10000);
 # ============================================================
 
 def main():
+    global SERVER_HOST
     port = DEFAULT_PORT
     host = "127.0.0.1"
     for i, arg in enumerate(sys.argv[1:]):
@@ -3317,6 +3504,7 @@ def main():
             port = int(sys.argv[i + 2])
         if arg == "--host" and i + 2 <= len(sys.argv[1:]):
             host = sys.argv[i + 2]
+    SERVER_HOST = host
 
     if not CONFIG_FILE.exists():
         save_config(default_config())
@@ -3324,17 +3512,34 @@ def main():
 
     server = http.server.ThreadingHTTPServer((host, port), APIHandler)
 
-    print(f"""
-╔══════════════════════════════════════════════╗
-║  🦙 llama-deploy 智能管理器 v{VERSION}           ║
-╠══════════════════════════════════════════════╣
-║                                              ║
-║  🌐 管理界面: http://localhost:{port}          ║
-║  📡 监听地址:  http://{host}:{port}             ║
-║                                              ║
-║  Ctrl+C 退出                                 ║
-╚══════════════════════════════════════════════╝
-    """)
+    # 逐行按显示宽度补齐，避免中文/emoji（终端里占两列）把边框顶歪。
+    def _w(text: str) -> int:
+        return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                   for ch in text)
+
+    lines = [
+        f"🦙 llama-deploy 智能管理器 v{VERSION}",
+        None,
+        f"🌐 管理界面: http://localhost:{port}",
+        f"📡 监听地址: http://{host}:{port}",
+        None,
+        "Ctrl+C 退出",
+    ]
+    inner = max(_w(x) for x in lines if x) + 4
+    print()
+    print("╔" + "═" * inner + "╗")
+    for index, text in enumerate(lines):
+        if text is None:
+            print("║" + " " * inner + "║")
+        else:
+            print("║  " + text + " " * (inner - 2 - _w(text)) + "║")
+        if index == 0:
+            print("╠" + "═" * inner + "╣")
+    print("╚" + "═" * inner + "╝")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("⚠️  管理器正在监听非回环地址，局域网内其他设备可以访问；"
+              "请确认所处网络可信")
+    print()
 
     try:
         server.serve_forever()

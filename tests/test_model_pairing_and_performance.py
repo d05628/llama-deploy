@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
+import compat
 import deploy
 import manager
 import run
@@ -65,6 +67,136 @@ class ModelPairingTests(unittest.TestCase):
             with mock.patch.object(deploy, "MODELS_DIR", root):
                 self.assertTrue(subject._find_mmproj_file())
             self.assertEqual(subject.mmproj_path.read_bytes(), b"r" * 20000)
+
+
+class SecurityTests(unittest.TestCase):
+    def test_model_name_rejects_traversal_and_globs(self):
+        for bad in ["../etc/passwd", "a/b.gguf", "a\\b.gguf", "*.gguf",
+                    "model?.gguf", "m[0-9].gguf", "", ".", ".."]:
+            self.assertFalse(manager.safe_model_name(bad), bad)
+        for good in ["Qwen3.8-27B-UD-IQ4_XS.gguf", "a.gguf", "模型-Q4_K_M.gguf"]:
+            self.assertTrue(manager.safe_model_name(good), good)
+
+    def test_delete_refuses_glob_pattern(self):
+        # rglob 会把 "*.gguf" 当通配符匹配到任意模型并删除
+        result = manager.ModelLibrary.delete("*.gguf")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("非法文件名", result["message"])
+
+    def test_activate_refuses_unknown_file(self):
+        result = manager.ModelLibrary.activate("definitely-not-here-xyz.gguf")
+        self.assertEqual(result["status"], "error")
+
+    def test_session_token_is_unpredictable(self):
+        self.assertGreaterEqual(len(manager.SESSION_TOKEN), 32)
+        self.assertNotEqual(manager.SESSION_TOKEN, "__MANAGER_TOKEN__")
+
+    def test_manager_sends_no_wildcard_cors(self):
+        source = (manager.BASE_DIR / "manager.py").read_text(encoding="utf-8")
+        self.assertNotIn('"Access-Control-Allow-Origin", "*"', source)
+
+    def test_compat_auth_required_only_for_real_keys(self):
+        handler = compat.CompatHandler
+        for disabled in ["", "local-no-key-needed", "none", "disabled", "no-key", "  NONE  "]:
+            self.assertFalse(handler.auth_required(disabled), disabled)
+        for enabled in ["my-secret", "sk-abc123", " Real-Key "]:
+            self.assertTrue(handler.auth_required(enabled), enabled)
+
+    def test_zip_extraction_rejects_traversal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            evil = root / "evil.zip"
+            with zipfile.ZipFile(evil, "w") as archive:
+                archive.writestr("../escaped.txt", "pwned")
+            dest = root / "out"
+            dest.mkdir()
+            with zipfile.ZipFile(evil) as archive:
+                with self.assertRaises(RuntimeError):
+                    deploy.Deployer._safe_extractall(archive, dest)
+            self.assertFalse((root / "escaped.txt").exists())
+
+    def test_zip_extraction_allows_normal_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            good = root / "ok.zip"
+            with zipfile.ZipFile(good, "w") as archive:
+                archive.writestr("sub/a.txt", "hello")
+            dest = root / "out"
+            dest.mkdir()
+            with zipfile.ZipFile(good) as archive:
+                deploy.Deployer._safe_extractall(archive, dest)
+            self.assertEqual((dest / "sub" / "a.txt").read_text(), "hello")
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    def test_pid_running_checks_process_identity(self):
+        # PID 会被系统复用；只判断"存在这个 PID"就 kill 会误杀无关进程
+        with mock.patch.object(manager, "process_name", return_value="notepad.exe"):
+            self.assertFalse(manager.pid_running(1234, "llama-server"))
+            self.assertTrue(manager.pid_running(1234, "notepad"))
+            self.assertTrue(manager.pid_running(1234))
+
+    def test_pid_running_rejects_invalid_pid(self):
+        self.assertFalse(manager.pid_running(0, "llama-server"))
+        self.assertFalse(manager.pid_running(-1))
+
+
+class FrontendHygieneTests(unittest.TestCase):
+    """内嵌前端的回归测试：这些是无法靠 Python 测试覆盖的部分。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (manager.BASE_DIR / "manager.py").read_text(encoding="utf-8")
+
+    def test_escaping_helpers_exist(self):
+        self.assertIn("function esc(v)", self.source)
+        self.assertIn("function escArg(v)", self.source)
+
+    def test_api_helper_checks_http_status(self):
+        self.assertIn("if(!r.ok)", self.source)
+
+    def test_no_blocking_alert_dialogs(self):
+        self.assertNotIn("alert('", self.source)
+        self.assertNotIn("alert((r", self.source)
+
+    def test_labels_are_bound_to_controls(self):
+        unbound = self.source.count('<label class="form-label">')
+        self.assertEqual(unbound, 0, "仍有 label 未通过 for= 绑定控件")
+
+    def test_narrow_screens_keep_device_info(self):
+        # 旧样式在 768px 断点直接 .sys-info{display:none}，
+        # 把显存预算这类最该看的信息藏掉了
+        block = self.source.split("@media(max-width:768px)")[1].split("}")[0]
+        self.assertNotIn("display:none", block.replace(".nav-text,.sidebar .logo span{display:none", ""))
+
+
+class ConfigDefaultsTests(unittest.TestCase):
+    """默认配置曾有三份副本（Python / 前端 JS / config.example.jsonc）。
+    前端那份已改为向后端拉取，示例文件用本测试锁住，防止再次漂移。"""
+
+    @staticmethod
+    def _keys(obj, prefix=""):
+        found = set()
+        for key, value in obj.items():
+            found.add(prefix + key)
+            if isinstance(value, dict):
+                found |= ConfigDefaultsTests._keys(value, prefix + key + ".")
+        return found
+
+    def test_example_config_matches_default_config(self):
+        example = run.parse_jsonc(manager.BASE_DIR / "config.example.jsonc")
+        self.assertTrue(example, "config.example.jsonc 解析失败")
+        defaults = manager.default_config()
+        missing = self._keys(defaults) - self._keys(example)
+        extra = self._keys(example) - self._keys(defaults)
+        self.assertEqual(missing, set(), "config.example.jsonc 缺少这些字段")
+        self.assertEqual(extra, set(), "config.example.jsonc 多出这些字段")
+
+    def test_frontend_has_no_second_copy_of_defaults(self):
+        # 前端只能通过 /api/config/default 取默认值，不能再自带一份字面量
+        source = (manager.BASE_DIR / "manager.py").read_text(encoding="utf-8")
+        self.assertIn("/api/config/default", source)
+        self.assertNotIn("local-no-key-needed',claude_tool_mode", source)
 
 
 class QuantDetectionTests(unittest.TestCase):

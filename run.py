@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import csv
 import io
 import json
 import os
@@ -867,22 +868,42 @@ def diagnose(model_path: Path) -> str:
     return ""
 
 
-def pid_running(pid: int) -> bool:
-    """跨平台检测进程是否存活。"""
+def process_name(pid: int) -> str:
+    """返回该 PID 的进程名，取不到时返回空字符串。"""
     try:
         if IS_WIN:
-            r = rc(["tasklist", "/FI", f"PID eq {pid}", "/NH"], timeout=5)
-            return r.returncode == 0 and str(pid) in r.stdout
-        else:
-            # os.kill(pid, 0)：发送空信号，不杀死进程；进程存在则不抛异常
+            r = rc(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"], timeout=5)
+            if r.returncode != 0 or not (r.stdout or "").strip():
+                return ""
+            row = next(csv.reader(io.StringIO(r.stdout.strip())), [])
+            return (row[0] if row else "").strip('"')
+        r = rc(["ps", "-p", str(pid), "-o", "comm="], timeout=5)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def pid_running(pid: int, expect: str = "") -> bool:
+    """跨平台检测进程是否存活；给了 expect 就同时核对进程名。
+
+    PID 会被系统回收复用，只判断"存在这个 PID"就去 kill，
+    在 PID 文件过期时会误杀无关进程。
+    """
+    if pid <= 0:
+        return False
+    name = process_name(pid)
+    if not name:
+        # 取不到进程名（权限不足等），退回到仅判断存活
+        try:
+            if IS_WIN:
+                return False
             os.kill(pid, 0)
             return True
-    except (ProcessLookupError, PermissionError):
-        # ProcessLookupError: 进程不存在
-        # PermissionError: 进程存在但无权限（Linux），仍视为存活
-        return isinstance(sys.exc_info()[1], PermissionError)
-    except Exception:
-        return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+    return expect.lower() in name.lower() if expect else True
 
 
 def _safe_int(val, default: int) -> int:
@@ -1387,6 +1408,11 @@ def cmd_stop() -> int:
         PID_FILE.unlink(missing_ok=True)
         return 1
 
+    if not pid_running(pid, "llama-server"):
+        print(f"PID {pid} 已不是 llama-server 进程（可能已退出且 PID 被复用），仅清除 PID 文件")
+        PID_FILE.unlink(missing_ok=True)
+        return 0
+
     try:
         if IS_WIN:
             r = subprocess.run(
@@ -1434,7 +1460,7 @@ def cmd_status(cfg: dict) -> int:
         print(f"   GPU 后端:      {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()} | free={gpu.get('vram_free_mb', 0)}MB{capability}")
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-        if pid_running(pid): print(f"   服务状态:      运行中 (PID: {pid})"); print(f"   地址:          http://localhost:{sc.get('port', 8080)}")
+        if pid_running(pid, "llama-server"): print(f"   服务状态:      运行中 (PID: {pid})"); print(f"   地址:          http://localhost:{sc.get('port', 8080)}")
         else: print("   服务状态:      未运行 (PID 文件残留)"); PID_FILE.unlink(missing_ok=True)
     else:
         print("   服务状态:      未运行")

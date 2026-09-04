@@ -693,8 +693,17 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
                        ctx_size: int, vision=False, mmproj_mb=0.0) -> dict:
     """按模型和实际空闲显存生成可移植的单路推理参数。显式配置始终优先。"""
     profile = str(pc.get("profile", "auto") or "auto").strip().lower()
-    if profile not in {"auto", "maximum", "compatible"}:
-        profile = "auto"
+    # 三档取舍（实测依据见 docs/performance-tuning.md 第 9 节）：
+    #   quality  质量 —— KV f16，只用无损推测解码，输出与参考解码逐字节一致
+    #   balanced 平衡 —— KV q8_0（实测速度与 f16 相同但省显存），同样逐字节一致
+    #   speed    极速 —— 额外启用 draft-mtp，代码场景可达 1.4-2.1 倍，
+    #                    但实测其输出与参考解码不同，属于以保真度换速度
+    # auto / maximum 沿用既有语义并对齐到 balanced：绝不因为换了档位名就
+    # 悄悄改变用户的输出。要启用 MTP 必须显式选 speed 或设置 spec_type。
+    profile = {"auto": "balanced", "maximum": "balanced",
+               "质量": "quality", "平衡": "balanced", "极速": "speed"}.get(profile, profile)
+    if profile not in {"quality", "balanced", "speed", "compatible"}:
+        profile = "balanced"
     size_mb = model_size_mb(model_path)
     total_mb = int(gpu.get("vram_mb", 0) or 0)
     free_mb = int(gpu.get("vram_free_mb", 0) or total_mb)
@@ -702,6 +711,10 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     denominator = max(1, min(value for value in (total_mb, free_mb) if value > 0)) if (total_mb > 0 or free_mb > 0) else 1
     pressure = size_mb / denominator if cuda else 0.0
     dense_27b = is_qwen38_dense_27b(model_path, meta)
+    # mmproj 放 CPU 可让文本生成回到满速，代价是图片编码改在 CPU 上跑。
+    # 实测：放 GPU 文本 17.7 t/s / 单图 7.5s；放 CPU 文本 26.6 t/s / 单图 29.0s。
+    # 偶尔看图、以文本为主的用法适合放 CPU，图片密集的用法应留在 GPU。
+    mmproj_offload = _config_bool(pc.get("mmproj_offload", True), True)
     flash_next = is_qwen38_flash_next(model_path, meta)
     notes = []
 
@@ -709,10 +722,10 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
         configured = str(pc.get(key, "auto") or "auto").lower()
         if configured != "auto":
             return configured
-        if profile == "compatible" or not cuda:
+        if profile in ("compatible", "quality") or not cuda:
             return "f16"
         # 高显存压力和长上下文使用 Q8 KV，把节省的空间让给模型层。
-        if profile == "maximum" or pressure >= 0.68 or ctx_size >= 8192:
+        if profile in ("balanced", "speed") or pressure >= 0.68 or ctx_size >= 8192:
             return "q8_0"
         return "f16"
 
@@ -728,19 +741,22 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     elif dense_27b and total_mb >= 15000:
         # 权重比显存还大，留给驱动的余量每多 100MiB 就少一点权重驻留 GPU。
         # 实测 16GB 卡上 64 比 256 快约 15%，代价是显存余量更紧。
-        fit_target = 64 if profile == "maximum" else 256
+        fit_target = 256 if profile == "quality" else 64
         notes.append("Qwen3.8 27B / 16GB 显存高压模式：优先保留更多模型层在 GPU")
     elif pressure >= 0.80:
-        fit_target = 384 if profile == "maximum" else 512
+        fit_target = 512 if profile == "quality" else 384
     elif is_blackwell(gpu):
-        fit_target = 512 if profile == "maximum" else 768
+        fit_target = 768 if profile == "quality" else 512
     else:
         fit_target = 1024
 
     text_mode_fit_target = fit_target
-    if cuda and vision and not configured_target:
-        # 视觉编码器的中间张量峰值很高，要给它留出 mmproj 量级的余量
-        fit_target = max(1024, min(4096, int(mmproj_mb * 1.1) + 512))
+    if cuda and vision and mmproj_offload and not configured_target:
+        # 视觉编码器要留缓冲，但此前按 mmproj*1.1+512 预留过头了：
+        # 实测 16GB 卡上预留 1488MiB 时文本 10.5 t/s、单图 9.9s，
+        # 收到 768MiB 后变成 17.7 t/s、单图 7.5s —— 两项都更好。
+        # 预留过多会把权重挤到 CPU，反而拖慢视觉编码本身。
+        fit_target = max(512, min(2048, int(mmproj_mb * 0.9)))
 
     available_memory_mb = float(meminfo().get("avail_gb", 0) or 0) * 1024 + free_mb
     if flash_next and size_mb > available_memory_mb * 0.92:
@@ -818,6 +834,7 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
         "cache_type_k": cache_value("cache_type_k"),
         "cache_type_v": cache_value("cache_type_v"),
         "fit_target_mb": fit_target,
+        "mmproj_offload": mmproj_offload,
         "notes": notes,
     }
 
@@ -1040,18 +1057,30 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         common += ["-tb", str(threads_batch)]
 
     spec_setting = str(pc.get("spec_type", pc.get("speculative", "auto"))).strip().lower()
+    # "auto" 表示跟随性能档位：只有极速档才启用会改变输出的 draft-mtp。
+    # 实测（docs/performance-tuning.md 第 9 节）：贪心解码下 draft-mtp 的输出
+    # 与参考解码 0/3 一致，而 ngram-map-k 是 3/3 一致。因此默认档位不开 MTP，
+    # 避免"为了速度悄悄牺牲保真度"。
+    if spec_setting == "auto":
+        spec_setting = "draft-mtp" if tuning["profile"] == "speed" else "off"
     spec_requested = spec_setting not in ("", "0", "false", "off", "none", "no")
     mtp_available = has_mtp_head(model)
     spec_mtp_supported = supports(binary, "--spec-type") and "draft-mtp" in help_text(binary)
     spec_mtp_enabled = False
     if mode == "server" and spec_requested:
-        if vision:
-            warn.append("视觉模式下暂不启用 MTP speculative decoding，避免 multimodal slot/OOM 兼容问题")
+        if vision and tuning["mmproj_offload"]:
+            warn.append("mmproj 驻留 GPU 时显存余量不足，已跳过 MTP；"
+                        "如需极速可设置 mmproj_offload=false 把视觉编码器放到 CPU")
         elif is_qwen38_flash_next(model, meta) and not _config_bool(pc.get("allow_experimental_mtp", False)):
             warn.append("Flash-Next 的 llama.cpp MTP 路径仍属实验实现；默认不启用，如需测试请显式设置 allow_experimental_mtp=true")
         elif spec_setting in ("auto", "true", "on", "1", "mtp", "draft-mtp"):
             if mtp_available and spec_mtp_supported:
                 spec_mtp_enabled = True
+                warn.append(
+                    "已启用 draft-mtp 推测解码：代码场景实测可达 1.4-2.1 倍，"
+                    "但实测其输出与不开推测解码时不同（贪心解码下 0/3 条一致）。"
+                    "若要求输出与参考解码逐字节一致，请改用 balanced 或 quality 档位"
+                )
             elif spec_setting not in ("auto", "true", "on", "1"):
                 warn.append("已请求 MTP，但当前模型或 llama.cpp 不支持 draft-mtp，已跳过")
         else:
@@ -1165,7 +1194,12 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         if _config_bool(pc.get("kv_unified", True), True) and supports(binary, "--kv-unified"):
             args.append("--kv-unified")
         if spec_mtp_enabled:
-            args += ["--spec-type", "draft-mtp"]
+            # ngram-map-k 实测无损（贪心解码下 3/3 与参考一致）且不占显存，
+            # 与 MTP 搭配时代码场景还能再快一点，故一并启用。
+            spec_types = "draft-mtp"
+            if "ngram-map-k" in help_text(binary):
+                spec_types += ",ngram-map-k"
+            args += ["--spec-type", spec_types]
             if supports(binary, "--spec-draft-n-max"):
                 args += ["--spec-draft-n-max", str(_safe_int(pc.get("spec_draft_n_max", 3), 3) or 3)]
             if supports(binary, "--spec-draft-ngl"):
@@ -1176,6 +1210,9 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
             args.append("--no-mmproj")
         if vision and mmproj and mmproj.exists():
             args += ["--mmproj", str(mmproj)]
+            # mmproj 放 CPU：文本生成回到满速，代价是图片编码转由 CPU 承担
+            if not tuning["mmproj_offload"] and supports(binary, "--no-mmproj-offload"):
+                args.append("--no-mmproj-offload")
 
     # ── GPU 卸载层数 ─────────────────────────────────────────────────────────
     # gpu_layers: -1 = 自动（按显存估算或 -ngl auto）；0 = 禁用 GPU；>0 = 手动指定层数

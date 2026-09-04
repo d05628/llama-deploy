@@ -315,9 +315,43 @@ class PerformanceDetectionTests(unittest.TestCase):
                 {"profile": "auto", "cache_type_k": "auto", "cache_type_v": "auto"},
                 8192,
             )
-        self.assertEqual(tuning["fit_target_mb"], 256)
+        # auto 对齐到 balanced：留 64MiB 余量、KV 用 q8_0
+        self.assertEqual(tuning["fit_target_mb"], 64)
         self.assertEqual(tuning["cache_type_k"], "q8_0")
         self.assertEqual(tuning["cache_type_v"], "q8_0")
+
+    def _high_pressure(self, profile):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 15500,
+            "compute_capability": "12.0",
+        }
+        meta = {"general.architecture": "qwen35", "block_count": 64}
+        with mock.patch.object(run, "model_size_mb", return_value=15.65 * 1024), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            return run.performance_tuning(
+                Path("Qwen3.8-27B-Q4_K_M.gguf"), meta, gpu,
+                {"profile": profile, "cache_type_k": "auto", "cache_type_v": "auto"},
+                8192,
+            )
+
+    def test_quality_profile_keeps_kv_at_full_precision(self):
+        self.assertEqual(self._high_pressure("quality")["cache_type_k"], "f16")
+        self.assertEqual(self._high_pressure("balanced")["cache_type_k"], "q8_0")
+        self.assertEqual(self._high_pressure("speed")["cache_type_k"], "q8_0")
+
+    def test_quality_profile_leaves_more_headroom(self):
+        self.assertGreater(self._high_pressure("quality")["fit_target_mb"],
+                           self._high_pressure("speed")["fit_target_mb"])
+
+    def test_legacy_profile_names_still_work(self):
+        # 老配置里的 auto / maximum 必须继续可用，且不得因改名而改变输出
+        for legacy in ("auto", "maximum"):
+            self.assertEqual(self._high_pressure(legacy)["profile"], "balanced")
+        self.assertEqual(self._high_pressure("compatible")["profile"], "compatible")
+
+    def test_unknown_profile_falls_back_to_balanced(self):
+        self.assertEqual(self._high_pressure("nonsense")["profile"], "balanced")
 
     def test_explicit_cache_setting_overrides_profile(self):
         gpu = {
@@ -432,7 +466,11 @@ class PerformanceDetectionTests(unittest.TestCase):
                 params, 16384, vision=True, mmproj_mb=888,
             )["fit_target_mb"]
         self.assertGreater(vis, text)
-        self.assertGreaterEqual(vis, 888)   # 至少要覆盖 mmproj 自身
+        # 早先假设"预留必须覆盖 mmproj 自身体积"，实测证明这个假设是错的：
+        # 预留 1488MiB 时文本 10.5 t/s、单图 9.9s；收到 768MiB 后
+        # 变成 17.7 t/s、单图 7.5s —— 预留过头会把权重挤到 CPU，
+        # 反过来拖慢视觉编码本身。所以只要求比文本模式多留，不要求覆盖 mmproj。
+        self.assertLess(vis, 888)
 
     def test_explicit_fit_target_still_wins_in_vision_mode(self):
         gpu = {

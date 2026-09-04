@@ -46,7 +46,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -334,6 +334,46 @@ def ensure_paired_mmproj_alias(model_file: str, mmproj_file: str) -> str:
         except OSError:
             shutil.copy2(source, target)
     return paired_name if target.exists() else source_name
+
+
+# llama.cpp 支持的全部量化类型，外加 Unsloth 动态量化的 XL/L/M 变体。
+# 顺序无关：detect_quant 按名字长度从长到短匹配，避免 F16 抢在 BF16 前面、
+# Q4_K 抢在 Q4_K_M 前面这类误判。
+QUANT_TYPES = (
+    "F32", "F16", "BF16", "MXFP4_MOE", "MXFP4",
+    "Q8_K_XL", "Q8_K_L", "Q8_0",
+    "Q6_K_XL", "Q6_K_L", "Q6_K_M", "Q6_K",
+    "Q5_K_XL", "Q5_K_M", "Q5_K_S", "Q5_K", "Q5_1", "Q5_0",
+    "Q4_K_XL", "Q4_K_M", "Q4_K_S", "Q4_K", "Q4_1", "Q4_0",
+    "Q3_K_XL", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q3_K",
+    "Q2_K_XL", "Q2_K_S", "Q2_K", "Q2_0", "Q1_0",
+    "IQ4_XS", "IQ4_NL",
+    "IQ3_XXS", "IQ3_XS", "IQ3_M", "IQ3_S",
+    "IQ2_XXS", "IQ2_XS", "IQ2_M", "IQ2_S",
+    "IQ1_M", "IQ1_S",
+    "TQ2_0", "TQ1_0",
+)
+
+_QUANT_BY_LENGTH = tuple(sorted(QUANT_TYPES, key=len, reverse=True))
+
+
+def detect_quant(filename: str) -> str:
+    """从 GGUF 文件名解析量化类型，解析不出时返回 "unknown"。
+
+    必须按长度从长到短匹配："mmproj-BF16.gguf" 里同时含有 "BF16" 和 "F16"，
+    短的先匹配就会把 BF16 误标成 F16。
+
+    视觉模块的配对命名会把主模型的量化写进文件名
+    （如 "Qwen3.8-27B-UD-Q4_K_M-mmproj-BF16.gguf"），只取 "mmproj" 之后的部分，
+    否则会把视觉模块标成主模型的量化。
+    """
+    low = str(filename or "").lower()
+    if "mmproj" in low:
+        low = low.rsplit("mmproj", 1)[1]
+    for quant in _QUANT_BY_LENGTH:
+        if quant.lower() in low:
+            return quant
+    return "unknown"
 
 
 def model_family(name: str) -> str:
@@ -694,14 +734,7 @@ class HuggingFaceSource(ModelSource):
             if not fname.lower().endswith(".gguf"):
                 continue
             size = size_map.get(fname, 0) or sib.get("size", 0) or 0
-            quant = "unknown"
-            for q in ["Q2_K","Q3_K_S","Q3_K_M","Q3_K_L","Q4_0","Q4_K_S",
-                       "Q4_K_M","Q5_0","Q5_K_S","Q5_K_M","Q6_K","Q8_0",
-                       "F16","BF16","F32","IQ1_S","IQ2_XXS","IQ2_XS",
-                       "IQ3_XXS","IQ3_XS","IQ4_XS","IQ4_NL"]:
-                if q.lower() in fname.lower() or q in fname:
-                    quant = q
-                    break
+            quant = detect_quant(fname)
             is_mmproj = "mmproj" in fname.lower()
             raw_files.append({
                 "filename": fname, "size": size, "quant": quant,
@@ -926,10 +959,7 @@ class ModelScopeSource(ModelSource):
                     try: size = int(v); break
                     except: pass
             ram_est = round(size/(1024**3)*1.2+0.8, 1) if size else 0
-            quant = "unknown"
-            for q in ["Q2_K","Q3_K_S","Q3_K_M","Q3_K_L","Q4_0","Q4_K_S",
-                       "Q4_K_M","Q5_0","Q5_K_S","Q5_K_M","Q6_K","Q8_0","F16","BF16","F32"]:
-                if q.lower() in fname.lower(): quant = q; break
+            quant = detect_quant(fname)
             is_mmproj = "mmproj" in fname.lower()
             base = self.bases[0]
             files.append({
@@ -1159,11 +1189,7 @@ class GiteeAISource(ModelSource):
             if not str(fname).lower().endswith(".gguf"):
                 continue
             size = int(item.get("size", 0) or 0)
-            quant = "unknown"
-            for q in ["Q2_K","Q3_K_M","Q4_0","Q4_K_S","Q4_K_M","Q5_K_M","Q6_K","Q8_0","F16","BF16"]:
-                if q.lower() in str(fname).lower():
-                    quant = q
-                    break
+            quant = detect_quant(fname)
             is_mmproj = "mmproj" in str(fname).lower()
             files.append({
                 "filename": fname,
@@ -1207,7 +1233,23 @@ def get_source(name: str, config: dict = None) -> ModelSource:
 #  RAM 推荐引擎
 # ============================================================
 
-def get_recommendations(ram_gb: float, vram_mb: int = 0) -> dict:
+def gpu_weight_budget_gb(vram_mb: int, vram_free_mb: int = 0) -> float:
+    """权重能完整驻留显存的体积上限（GB）。
+
+    显存不是全都能装权重：还要扣掉 KV cache、计算缓冲、CUDA context，
+    独显还要负担桌面显示。实测 16GB 卡上空闲 14.6GB、运行开销约 0.6GB、
+    16k 上下文 q8_0 KV 约 0.5GB，实际可放权重 13.45GB，与本式吻合。
+    已知实际空闲显存时用空闲值更准，否则按总量打九折估算桌面占用。
+    """
+    if vram_mb <= 0:
+        return 0.0
+    usable_gb = (vram_free_mb if 0 < vram_free_mb <= vram_mb else vram_mb * 0.92) / 1024
+    # 运行开销约 0.6GB，再按显存档位为 KV cache 预留一份
+    reserve = 0.6 + (0.55 if usable_gb >= 12 else 0.3 if usable_gb >= 6 else 0.15)
+    return max(0.0, round(usable_gb - reserve, 1))
+
+
+def get_recommendations(ram_gb: float, vram_mb: int = 0, vram_free_mb: int = 0) -> dict:
     usable = ram_gb * 0.65
     max_model_gb = usable - 0.3
     recs = {
@@ -1218,17 +1260,24 @@ def get_recommendations(ram_gb: float, vram_mb: int = 0) -> dict:
     }
     if vram_mb > 0:
         vram_gb = vram_mb / 1024
-        recs["gpu_max_model_gb"] = round(vram_gb * 0.85, 1)
-        recs["tips"].append(f"检测到 GPU 显存 {vram_gb:.1f}GB，可加载 ≤{recs['gpu_max_model_gb']}GB 的模型到 GPU")
-        recs["tips"].append("建议设置 gpu_layers=-1 将全部层卸载到 GPU")
-        if vram_gb >= 6:
-            recs["tips"].append("显存充足，可使用 Q5_K_M 或 Q8_0 量化获得更好质量")
-    if ram_gb <= 4:
-        recs["tips"].extend(["建议 0.5-1B 参数模型", "Q4_K_M 量化最佳", "关闭思考模式节省内存"])
-    elif ram_gb <= 8:
-        recs["tips"].append("可运行 1-3B 参数模型")
+        budget = gpu_weight_budget_gb(vram_mb, vram_free_mb)
+        recs["gpu_max_model_gb"] = budget
+        # 上下文长度受限于权重之外剩下的显存，与系统内存无关。
+        recs["recommended_ctx"] = 16384 if vram_gb >= 12 else (8192 if vram_gb >= 6 else 4096)
+        recs["tips"].append(
+            f"检测到 GPU 显存 {vram_gb:.1f}GB，权重 ≤{budget}GB 的模型可完整驻留显存"
+        )
+        recs["tips"].append(
+            f"超过 {budget}GB 的模型会有部分层落在 CPU 上，吐字速度成倍下降；"
+            f"宁可选小一档量化，也不要选装不下的档位"
+        )
+        recs["tips"].append("gpu_layers=-1 表示按实时显存自动拟合层数（不是强制全部卸载）")
     else:
-        recs["tips"].append("可运行 3-7B+ 参数模型")
+        recs["tips"].append("未检测到可用 GPU，将以 CPU 模式运行，速度受内存带宽限制")
+    if ram_gb <= 4:
+        recs["tips"].extend(["建议 0.5-1B 参数模型", "关闭思考模式节省内存"])
+    elif ram_gb <= 8:
+        recs["tips"].append("内存可支撑 1-3B 参数模型")
     return recs
 
 
@@ -1601,13 +1650,7 @@ class ModelLibrary:
             rel_path = f.relative_to(MODELS_DIR)
 
             # 解析量化类型
-            quant = "unknown"
-            for q in ["Q2_K","Q3_K_S","Q3_K_M","Q3_K_L","Q4_0","Q4_K_S",
-                       "Q4_K_M","Q5_0","Q5_K_S","Q5_K_M","Q6_K","Q8_0",
-                       "F16","BF16","F32","IQ2_XXS","IQ2_XS","IQ3_XXS","IQ4_NL"]:
-                if q.lower() in f.name.lower() or q in f.name:
-                    quant = q
-                    break
+            quant = detect_quant(f.name)
 
             size = f.stat().st_size
             models.append({
@@ -1782,7 +1825,8 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
         elif path == "/api/recommend":
             ram = float(params.get("ram", "4"))
             vram = int(params.get("vram", "0"))
-            self._json_resp(get_recommendations(ram, vram))
+            vram_free = int(params.get("vram_free", "0"))
+            self._json_resp(get_recommendations(ram, vram, vram_free))
 
         elif path == "/api/models":
             self._json_resp({"models": model_lib.scan()})
@@ -2424,6 +2468,7 @@ a{color:var(--primary);text-decoration:none}
 
 <script>
 var sysInfo={},currentConfig={},logPollTimer=null,logLineCount=0;
+var deviceRec=null;   // /api/recommend 的结果，renderFiles 判定显存是否装得下时复用
 
 async function api(url,method,body){
   try{
@@ -2481,15 +2526,20 @@ async function init(){
     (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
   loadConfig();pollStatus();updateSystemPage();
   var vram=sysInfo.gpu_vram_mb||0;
-  var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram);
+  var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
+  deviceRec=rec;
   var hint=document.getElementById('ramHint');
   if(rec&&rec.tips){
     hint.style.display='block';
     hint.innerHTML='<div style="font-size:13px"><strong>💡 设备: '+sysInfo.ram_gb+'GB 内存'+
       (sysInfo.gpu_name?' + '+sysInfo.gpu_name+' '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB':'')+
-      '</strong> · 推荐量化: <span class="tag tag-green">'+rec.recommended_quant+'</span>'+
+      '</strong>'+
+      // 有 GPU 时，"该选哪个量化"取决于模型多大，给不出与模型无关的答案；
+      // 真正可执行的是显存预算，所以只在没有 GPU 时才显示笼统的推荐量化。
+      (rec.gpu_max_model_gb
+        ?' · 权重预算: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+'GB 可完整驻留显存</span>'
+        :' · 推荐量化: <span class="tag tag-green">'+rec.recommended_quant+'</span>')+
       ' · 推荐 ctx: <span class="tag tag-yellow">'+rec.recommended_ctx+'</span>'+
-      (rec.gpu_max_model_gb?' · GPU可载: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+'GB</span>':'')+
       '<br><span style="color:var(--text3)">'+(rec.tips||[]).join(' · ')+'</span></div>';
   }
   var gpuEl=document.getElementById('gpuDetectInfo');
@@ -2500,14 +2550,21 @@ async function init(){
   }
   var guideEl=document.getElementById('gpuGuide');
   if(guideEl&&sysInfo.gpu_name){
-    var vg=(sysInfo.gpu_vram_mb/1024).toFixed(1);
+    // 用 MB 判档：显卡实际上报值总是略低于标称（"16GB" 卡报 16311MiB＝15.9GB），
+    // 拿 15.9 去比 >=16 永远不成立，16GB 卡会被当成 8GB 档。
+    var vmb=sysInfo.gpu_vram_mb||0;
+    var vg=(vmb/1024).toFixed(1);
+    var bud=(deviceRec&&deviceRec.gpu_max_model_gb)||0;
     guideEl.style.display='block';
     guideEl.innerHTML='<strong>💡 显存 '+vg+'GB 参考：</strong><br>'+
-      (vg>=16?'• 可流畅运行 14B 及以下模型（全部卸载到GPU）<br>• 32B 模型可部分卸载':
-       vg>=8?'• 可流畅运行 7-8B 模型（全部卸载到GPU）<br>• 14B 模型可部分卸载':
-       vg>=6?'• 可流畅运行 3-4B 模型（全部卸载到GPU）<br>• 7-8B 模型可部分卸载（约60%层）<br>• 更大模型建议自动模式':
-       vg>=4?'• 可流畅运行 1-2B 模型（全部卸载到GPU）<br>• 3B+ 模型建议自动模式':
+      (bud?'• <strong>权重 ≤'+bud+'GB 的模型可完整驻留显存</strong>，这是速度的分水岭<br>':'')+
+      (vmb>=15000?'• 14B 以下模型可完整驻留；27B/32B 需选 ≤'+(bud||13.5)+'GB 的量化档位':
+       vmb>=11000?'• 8-14B 模型可完整驻留；更大的建议选更小的量化档位':
+       vmb>=7500?'• 7-8B 模型可完整驻留；14B 会有部分层落在 CPU':
+       vmb>=5500?'• 3-4B 模型可完整驻留；7-8B 会有部分层落在 CPU':
+       vmb>=3500?'• 1-2B 模型可完整驻留；3B+ 建议用自动模式':
        '• 显存较小，建议使用自动模式')+
+      '<br>• 超出预算的部分会落到 CPU 内存上，带宽约为显存的 1/20，吐字速度成倍下降'+
       '<br>• <strong>推荐使用「🤖 自动」模式</strong>，系统会智能计算最佳配置';
   }
 }
@@ -2643,18 +2700,40 @@ function filterFiles(tab){
 function renderFiles(files){
   _visibleFiles = files || [];
   var QUANT_COLOR = {
-    'Q8_0':'tag-green','Q6_K':'tag-green','Q5_K_M':'tag-green','Q5_K_S':'tag-green',
-    'Q4_K_M':'tag-yellow','Q4_K_S':'tag-yellow','Q4_0':'tag-yellow',
-    'Q3_K_M':'tag-red','Q3_K_L':'tag-red','Q2_K':'tag-red',
-    'F16':'tag-blue','BF16':'tag-blue','IQ4_XS':'tag-yellow','IQ4_NL':'tag-yellow',
+    'F32':'tag-blue','F16':'tag-blue','BF16':'tag-blue',
+    'Q8_0':'tag-green','Q8_K_XL':'tag-green','Q8_K_L':'tag-green',
+    'Q6_K':'tag-green','Q6_K_XL':'tag-green','Q6_K_L':'tag-green','Q6_K_M':'tag-green',
+    'Q5_K_M':'tag-green','Q5_K_S':'tag-green','Q5_K_XL':'tag-green','Q5_K':'tag-green',
+    'Q4_K_M':'tag-yellow','Q4_K_S':'tag-yellow','Q4_K_XL':'tag-yellow','Q4_K':'tag-yellow',
+    'Q4_0':'tag-yellow','Q4_1':'tag-yellow','MXFP4_MOE':'tag-yellow','MXFP4':'tag-yellow',
+    'IQ4_XS':'tag-yellow','IQ4_NL':'tag-yellow',
+    'Q3_K_XL':'tag-red','Q3_K_L':'tag-red','Q3_K_M':'tag-red','Q3_K_S':'tag-red','Q3_K':'tag-red',
+    'IQ3_M':'tag-red','IQ3_S':'tag-red','IQ3_XS':'tag-red','IQ3_XXS':'tag-red',
+    'Q2_K':'tag-red','Q2_K_S':'tag-red','Q2_K_XL':'tag-red',
+    'IQ2_M':'tag-red','IQ2_S':'tag-red','IQ2_XS':'tag-red','IQ2_XXS':'tag-red',
+    'IQ1_M':'tag-red','IQ1_S':'tag-red','TQ1_0':'tag-red','TQ2_0':'tag-red',
   };
+  // 困惑度数据来自本项目实测（同架构 2B 模型，统一 imatrix，留出评测集），
+  // 详见 docs/performance-tuning.md 第 7 节。百分比为相对 BF16 的劣化。
   var QUANT_TIP = {
-    'Q8_0':'质量最高，文件较大','Q6_K':'质量极佳，推荐高显存用户',
-    'Q5_K_M':'质量佳，均衡选择','Q4_K_M':'质量/大小均衡，最推荐',
-    'Q4_K_S':'稍小一点，略有质量损失','Q4_0':'老格式，不如 Q4_K_M',
-    'Q3_K_M':'质量损失明显，内存受限时用','Q2_K':'质量较差，仅限内存极小设备',
-    'F16':'全精度，质量最佳，文件最大','BF16':'Brain Float16，适合训练',
-    'IQ4_XS':'iQuant 系列，比 Q4_K_S 小10%','IQ4_NL':'iQuant NL，质量接近 Q4_K_M',
+    'F16':'全精度，质量最佳，文件最大','BF16':'全精度，质量最佳，文件最大','F32':'未量化，体积极大',
+    'Q8_0':'几乎无损，文件很大','Q6_K':'质量极佳，约 6.6bpw',
+    'Q5_K_M':'质量佳，约 5.5bpw','Q5_K_S':'质量佳，略小于 Q5_K_M',
+    'Q4_K_M':'质量/体积均衡（实测 +2.5% 困惑度）','Q4_K_S':'略小于 Q4_K_M（+2.9%）',
+    'Q4_0':'老格式，同体积下不如 Q4_K_M','Q4_1':'老格式，同体积下不如 Q4_K_M',
+    'IQ4_XS':'体积比 Q4_K_M 小约 12%，质量几乎持平（+3.1%）；显存吃紧时的首选',
+    'IQ4_NL':'非线性 4bit，质量接近 Q4_K_M',
+    'MXFP4_MOE':'MoE 专用 4bit 浮点格式','MXFP4':'4bit 浮点格式',
+    'Q3_K_XL':'3bit 档，质量下降明显（Q3 档实测 +9.7%）',
+    'Q3_K_M':'质量损失明显（+9.7%），显存实在不够才用',
+    'Q3_K_L':'3bit 档，质量下降明显','Q3_K_S':'3bit 档，质量下降明显',
+    'IQ3_M':'3bit iQuant，优于同体积 Q3','IQ3_S':'3bit iQuant，优于同体积 Q3',
+    'IQ3_XS':'3bit iQuant，质量已明显下降','IQ3_XXS':'3bit iQuant，质量已明显下降',
+    'Q2_K':'质量较差，仅限显存极小的设备','Q2_K_S':'质量较差','Q2_K_XL':'质量较差',
+    'IQ2_M':'2bit，质量损失很大','IQ2_S':'2bit，质量损失很大',
+    'IQ2_XS':'2bit，质量损失很大','IQ2_XXS':'2bit，质量损失很大',
+    'IQ1_M':'1bit，通常不可用','IQ1_S':'1bit，通常不可用',
+    'TQ1_0':'三值量化，实验性','TQ2_0':'三值量化，实验性',
   };
   var vram = (sysInfo&&sysInfo.gpu_vram_mb||0)/1024;
   var c = document.getElementById('fileModalContent');
@@ -2667,10 +2746,21 @@ function renderFiles(files){
     var qTip = QUANT_TIP[f.quant]||f.quant;
     var sizeGb = f.size_gb||0;
     var ramOk = !f.ram_estimate_gb || sysInfo.ram_gb >= f.ram_estimate_gb;
-    var vramOk = !sizeGb || vram<=0 || vram >= sizeGb * 0.9;
-    var compat = ramOk&&vramOk ? '<span class="tag tag-green">✅ 兼容</span>' :
-                 !ramOk ? '<span class="tag tag-red">⚠️ 内存不足</span>' :
-                 '<span class="tag tag-yellow">⚠️ 显存可能不足</span>';
+    // 能否完整驻留显存，要和"扣掉 KV cache 与运行开销后的预算"比，
+    // 而不是和显存总量比：15.9GB 的卡装不下 15.3GB 的权重。
+    var budget = (deviceRec&&deviceRec.gpu_max_model_gb)||0;
+    var compat;
+    if(!ramOk){
+      compat = '<span class="tag tag-red">⚠️ 内存不足</span>';
+    } else if(!sizeGb || vram<=0 || !budget){
+      compat = '';   // 信息不足就不下结论
+    } else if(sizeGb <= budget){
+      compat = '<span class="tag tag-green">✅ 可完整驻留显存</span>';
+    } else if(sizeGb <= budget + vram*0.25){
+      compat = '<span class="tag tag-yellow">⚠️ 超出显存 '+(sizeGb-budget).toFixed(1)+'GB，部分层将落在 CPU，速度明显下降</span>';
+    } else {
+      compat = '<span class="tag tag-red">⚠️ 远超显存预算 '+budget.toFixed(1)+'GB，会非常慢</span>';
+    }
     var checkboxId = 'chk-' + f.filename.replace(/[^a-zA-Z0-9]/g,'_');
     return '<div class="model-card" style="cursor:default;'+(checked?'border-color:var(--primary);background:var(--primary-bg)':'')+'" id="card-'+checkboxId+'">'+
       '<div style="display:flex;align-items:flex-start;gap:10px">'+
@@ -3186,7 +3276,8 @@ async function pollStatus(){
 // ===== 系统信息 =====
 async function updateSystemPage(){
   var i=sysInfo;var vram=i.gpu_vram_mb||0;
-  var rec=await api('/api/recommend?ram='+i.ram_gb+'&vram='+vram);
+  var rec=await api('/api/recommend?ram='+i.ram_gb+'&vram='+vram+'&vram_free='+(i.gpu_vram_free_mb||0));
+  deviceRec=rec;
   document.getElementById('systemInfo').innerHTML=
     '<div class="card"><div class="card-title">🖥️ 硬件</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'+
@@ -3199,9 +3290,10 @@ async function updateSystemPage(){
     '<div class="form-hint">显存: '+(i.gpu_vram_mb/1024).toFixed(1)+' GB · 可用: '+(i.gpu_vram_free_mb/1024).toFixed(1)+' GB</div></div>':'')+
     '</div></div>'+
     '<div class="card"><div class="card-title">💡 AI 建议</div><div style="font-size:14px;line-height:2">'+
-    '<div>📦 推荐量化: <span class="tag tag-green">'+(rec.recommended_quant||'Q4_K_M')+'</span></div>'+
+    (rec.gpu_max_model_gb
+      ?'<div>🎮 权重预算: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+' GB 可完整驻留显存</span></div>'
+      :'<div>📦 推荐量化: <span class="tag tag-green">'+(rec.recommended_quant||'Q4_K_M')+'</span></div>')+
     '<div>📐 推荐 ctx: <span class="tag tag-yellow">'+(rec.recommended_ctx||2048)+'</span></div>'+
-    (rec.gpu_max_model_gb?'<div>🎮 GPU可载: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+' GB</span></div>':'')+
     '<hr style="border-color:var(--border);margin:8px 0">'+
     ((rec.tips||[]).map(function(t){return'<div>• '+t+'</div>'}).join(''))+
     '</div></div>';

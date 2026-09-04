@@ -67,6 +67,83 @@ class ModelPairingTests(unittest.TestCase):
             self.assertEqual(subject.mmproj_path.read_bytes(), b"r" * 20000)
 
 
+class QuantDetectionTests(unittest.TestCase):
+    def test_bf16_is_not_mistaken_for_f16(self):
+        # "bf16" 里含有 "f16"，短名先匹配就会把 BF16 误标成 F16
+        self.assertEqual(manager.detect_quant("Qwen3.5-2B-BF16.gguf"), "BF16")
+        self.assertEqual(manager.detect_quant("model-F16.gguf"), "F16")
+
+    def test_unsloth_dynamic_variants_are_recognised(self):
+        for name, expected in [
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", "Q4_K_M"),
+            ("Qwen3.8-27B-UD-IQ4_XS.gguf", "IQ4_XS"),
+            ("Qwen3.8-27B-UD-Q3_K_XL.gguf", "Q3_K_XL"),
+            ("Qwen3.8-27B-UD-Q4_K_XL.gguf", "Q4_K_XL"),
+            ("Qwen3.8-27B-UD-Q8_K_XL.gguf", "Q8_K_XL"),
+            ("Qwen3.8-27B-UD-IQ3_S.gguf", "IQ3_S"),
+            ("GLM-4.7-Flash-MXFP4_MOE.gguf", "MXFP4_MOE"),
+        ]:
+            self.assertEqual(manager.detect_quant(name), expected, name)
+
+    def test_longer_name_wins_over_its_own_prefix(self):
+        self.assertEqual(manager.detect_quant("m-Q4_K_M.gguf"), "Q4_K_M")
+        self.assertEqual(manager.detect_quant("m-Q4_K_S.gguf"), "Q4_K_S")
+        self.assertEqual(manager.detect_quant("m-Q4_K.gguf"), "Q4_K")
+
+    def test_mmproj_reports_its_own_precision_not_the_main_model(self):
+        # 配对命名会把主模型量化写进视觉模块的文件名
+        self.assertEqual(
+            manager.detect_quant("Qwen3.8-27B-UD-Q4_K_M-mmproj-BF16.gguf"), "BF16"
+        )
+        self.assertEqual(manager.detect_quant("mmproj-model-f16.gguf"), "F16")
+
+    def test_unparseable_name_is_unknown(self):
+        self.assertEqual(manager.detect_quant("some-model.gguf"), "unknown")
+        self.assertEqual(manager.detect_quant(""), "unknown")
+
+
+class GpuBudgetTests(unittest.TestCase):
+    def test_budget_is_well_below_total_vram(self):
+        # 15.9GB 的卡装不下 15.3GB 的权重：KV cache、计算缓冲和桌面都要占显存
+        budget = manager.gpu_weight_budget_gb(16311, 15063)
+        self.assertLess(budget, 14.0)
+        self.assertGreater(budget, 13.0)      # 实测预算 13.45GB
+        self.assertLess(budget, 15.33)        # 必须判定现用的 Q4_K_M 装不下
+        self.assertGreater(budget, 13.28)     # 且判定 IQ4_XS 装得下
+
+    def test_budget_falls_back_to_total_when_free_is_unknown(self):
+        self.assertGreater(manager.gpu_weight_budget_gb(16311, 0), 12.0)
+        self.assertEqual(manager.gpu_weight_budget_gb(0, 0), 0.0)
+
+    def test_bogus_free_value_is_ignored(self):
+        # 空闲值大于总量时不可信，退回按总量估算
+        self.assertEqual(
+            manager.gpu_weight_budget_gb(16311, 99999),
+            manager.gpu_weight_budget_gb(16311, 0),
+        )
+
+
+class RecommendationTests(unittest.TestCase):
+    def test_gpu_advice_does_not_contradict_the_budget(self):
+        # 旧实现在 vram>=6GB 时一律提示"可使用 Q5_K_M 或 Q8_0"，
+        # 完全不看模型多大——27B 的 Q5_K_M 是 19GB，根本装不下
+        recs = manager.get_recommendations(63.9, 16311, 15063)
+        joined = " ".join(recs["tips"])
+        self.assertNotIn("Q8_0", joined)
+        self.assertNotIn("Q5_K_M", joined)
+        self.assertIn(str(recs["gpu_max_model_gb"]), joined)
+
+    def test_context_recommendation_follows_vram_not_system_ram(self):
+        big_gpu = manager.get_recommendations(16, 16311, 15063)
+        small_gpu = manager.get_recommendations(64, 4096, 0)
+        self.assertGreater(big_gpu["recommended_ctx"], small_gpu["recommended_ctx"])
+
+    def test_gpu_layers_tip_does_not_promise_full_offload(self):
+        recs = manager.get_recommendations(63.9, 16311, 15063)
+        joined = " ".join(recs["tips"])
+        self.assertNotIn("将全部层卸载", joined)
+
+
 class PerformanceDetectionTests(unittest.TestCase):
     def test_multi_gpu_memory_is_aggregated(self):
         output = "NVIDIA A, 8192, 7000\nNVIDIA B, 12288, 11000\n"

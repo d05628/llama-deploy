@@ -74,6 +74,30 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertTrue(agents.workspace_warning(Path(Path.home().anchor)))
         self.assertEqual(agents.workspace_warning(agents.default_workspace()), "")
 
+    def test_vision_is_declared_to_tools_that_would_otherwise_assume_text_only(self):
+        # Qwen Code / OpenCode 对未知模型名按纯文本处理，不声明就不发图（实测回答"不支持图片"）
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for vision in (True, False):
+                agents.prepare_home("qwen", base / "qwen", GATEWAY, "local", 88064, vision=vision)
+                agents.prepare_home("opencode", base / "oc", GATEWAY, "local", 88064, vision=vision)
+                q = json.loads((base / "qwen" / "settings.json").read_text(encoding="utf-8"))
+                o = json.loads((base / "oc" / "opencode.json").read_text(encoding="utf-8"))
+                gen = q["modelProviders"]["openai"][0]["generationConfig"]
+                model = o["provider"]["llama-deploy"]["models"]["local"]
+                self.assertIs(gen["modalities"]["image"], vision)
+                self.assertIs(model["attachment"], vision)
+                self.assertEqual("image" in model["modalities"]["input"], vision)
+
+    def test_codex_skips_the_daemon_that_refuses_elevated_windows(self):
+        with mock.patch.object(agents, "IS_WIN", True):
+            self.assertIn("--no-daemon", agents.command_args("codex", Path("h"), "local"))
+
+    def test_aider_confirms_edits_but_never_runs_commands_by_itself(self):
+        args = agents.command_args("aider", Path("h"), "local")
+        self.assertIn("--yes-always", args)
+        self.assertIn("--no-suggest-shell-commands", args)
+
     def test_opencode_snapshots_are_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "opencode"

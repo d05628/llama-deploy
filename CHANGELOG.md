@@ -2,6 +2,23 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.2] - 2026-09-25
+
+用户实测 1.5.1 各 agent 后的第二轮修复。
+
+### 修复
+
+- **Codex 完全无法启动**：Codex 0.157 默认启动共享后台服务，在管理员窗口里直接拒绝运行
+  （"start the Windows daemon from a non-elevated terminal"）。启动器加 `--no-daemon`。
+- **Qwen Code、OpenCode 说自己"没有视觉能力"**：两者对未知模型名一律按纯文本处理，不声明就不把图片
+  发给模型。开「看图」时在各自的模型配置里显式声明（Qwen Code `generationConfig.modalities.image`，
+  OpenCode `attachment` + `modalities.input`，Aider `supports_vision`）。实测两者都能读出测试图里的数字和颜色。
+- **工作目录仍是整个用户目录**：旧版界面把用户目录存进了浏览器，新默认目录不生效。
+  遇到旧值（用户目录或盘符根目录）自动换成专用工作目录。
+- **Aider 每一步都要确认**：改文件改为自动确认（每次改动都会 git 提交，`/undo` 可撤销）；
+  同时关闭它的"建议执行命令"，避免自动确认连带执行 shell 命令。
+- Gemini CLI 简介补充：若弹出登录选项，选「Use Gemini API Key」即可，无需登录 Google。
+
 ## [1.5.1] - 2026-09-25
 
 修复用户实测 1.5.0「一键启动 Agent」时遇到的一连串问题。

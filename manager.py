@@ -51,7 +51,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -1493,7 +1493,7 @@ class DeployManager:
                   "install": info["install"],
                   "launcher": str(agents_launcher_path(key))} for key, info in agents.AGENTS.items()]
         return {"agents": items, "state": dict(self.agent_state),
-                "default_cwd": str(agents.default_workspace())}
+                "default_cwd": str(agents.default_workspace()), "home": str(Path.home())}
 
     def launch_agent(self, agent: str, cwd: str, vision: bool = False) -> dict:
         if agent not in agents.AGENTS:
@@ -1564,7 +1564,7 @@ class DeployManager:
             alias = gw.get("gateway_model_alias") or "llama-deploy-local"
             api_key = gw.get("gateway_api_key") or "local-no-key-needed"
             home = agents.agent_home(BASE_DIR, agent)
-            agents.prepare_home(agent, home, gateway, alias, n_ctx)
+            agents.prepare_home(agent, home, gateway, alias, n_ctx, vision=vision)
             env = agents.build_env(agent, home, gateway, alias, api_key, n_ctx)
             # agent 自己的目录也加进 PATH：不在 PATH 里的安装位置（如 ~/.local/bin）同样能启动
             exe_dir = [agents.command_path(agent).parent] if agents.command_path(agent) else []
@@ -3670,7 +3670,11 @@ async function loadAgents(){
   var box=document.getElementById('agentButtons');if(!box)return;
   var r=await api('/api/agents');if(!r||!r.agents){box.textContent='无法读取 agent 列表';return}
   var cwd=document.getElementById('agentCwd');
-  if(cwd&&!cwd.value){var saved='';try{saved=localStorage.getItem('agentCwd')||''}catch(e){}cwd.value=saved||r.default_cwd||''}
+  if(cwd&&!cwd.value){var saved='';try{saved=localStorage.getItem('agentCwd')||''}catch(e){}
+    var norm=function(p){return String(p||'').replace(/[\\/]+$/,'').toLowerCase()};
+    // 旧版默认是整个用户目录（会被浏览器记住）：agent 在里面会扫描/快照所有文件，换成专用工作目录
+    if(norm(saved)===norm(r.home)||/^[a-z]:[\\/]?$/i.test(saved))saved='';
+    cwd.value=saved||r.default_cwd||''}
   box.style.display='grid';box.style.gridTemplateColumns='repeat(auto-fit,minmax(260px,1fr))';
   box.innerHTML=r.agents.map(function(a){
     var btn=a.installed

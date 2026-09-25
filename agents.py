@@ -29,14 +29,14 @@ AGENTS = {
               "install": "npm install -g @openai/codex"},
     # 提示词针对 Gemini 模型调过：实测本地 Qwen 工具调用 3 次成功 2 次，偶尔把文件写到它的临时目录
     "gemini": {"name": "Gemini CLI", "command": "gemini", "tag": "不推荐",
-               "desc": "Google 出品；提示词针对 Gemini 调优，本地 Qwen 下偶尔把文件写到它自己的临时目录（Qwen Code 是它的 Qwen 调优分支）",
+               "desc": "Google 出品；提示词针对 Gemini 调优，本地 Qwen 下偶尔把文件写到它自己的临时目录（Qwen Code 是它的 Qwen 调优分支）。若弹出登录选项，选「2. Use Gemini API Key」即可，无需登录 Google",
                "install": "npm install -g @google/gemini-cli"},
     "opencode": {"name": "OpenCode", "command": "opencode",
                  "desc": "开源、界面美观，内置 plan/build 两种模式，支持任意 OpenAI 兼容模型",
                  "install": "npm install -g opencode-ai@latest"},
     # Aider 以 git 为中心、提示词精简，适合上下文有限的本地模型
     "aider": {"name": "Aider", "command": "aider",
-              "desc": "以 git 为中心的结对编程工具，改动自动提交；提示词精简，适合上下文有限的本地模型；不执行任意命令、不看图",
+              "desc": "以 git 为中心的结对编程工具：改文件无需逐次确认，每次改动自动 git 提交（/undo 可撤销）；不会执行命令（如渲染需自己运行），提示词精简",
               "install": "python -m pip install aider-install && aider-install"},
 }
 
@@ -148,7 +148,15 @@ def command_args(agent: str, home: Path, alias: str) -> list:
     if agent == "aider":
         return ["--model", f"openai/{alias}",
                 "--model-metadata-file", str(home / "model-metadata.json"),
-                "--no-show-model-warnings"]
+                "--no-show-model-warnings",
+                # 文件改动自动确认（每次改动都会 git 提交，可 /undo 撤销）；
+                # 不自动执行 shell 命令：Aider 的 --yes-always 会连"运行命令"也一并同意，
+                # 所以干脆不让它提议执行命令
+                "--yes-always", "--no-suggest-shell-commands"]
+    if agent == "codex" and IS_WIN:
+        # Codex 0.157 起默认启动共享后台服务，在管理员窗口里拒绝运行：
+        # "start the Windows daemon from a non-elevated terminal"
+        return ["--no-daemon"]
     return []
 
 
@@ -169,8 +177,13 @@ def codex_config(gateway: str, alias: str, n_ctx: int) -> str:
     )
 
 
-def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
-    """写入该 agent 独立配置目录里需要的文件（只写我们自己的目录）。"""
+def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int, vision: bool = False):
+    """写入该 agent 独立配置目录里需要的文件（只写我们自己的目录）。
+
+    vision：模型服务开了看图时，要在各工具的模型配置里显式声明支持图片。
+    Qwen Code / OpenCode 对未知模型名一律按纯文本处理，不声明就不会把图片发给模型，
+    实测它们都回答"当前模型不支持图片"。
+    """
     home.mkdir(parents=True, exist_ok=True)
     if agent == "codex":
         (home / "config.toml").write_text(codex_config(gateway, alias, n_ctx), encoding="utf-8")
@@ -185,7 +198,7 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
             "name": "llama-deploy (local)",
             "baseUrl": f"{gateway}/v1",
             "envKey": "LLAMA_DEPLOY_API_KEY",
-            "generationConfig": {"contextWindowSize": n_ctx},
+            "generationConfig": {"contextWindowSize": n_ctx, "modalities": {"image": bool(vision)}},
         }]}
         settings.setdefault("security", {}).setdefault("auth", {})["selectedType"] = "openai"
         settings.setdefault("model", {})["name"] = alias
@@ -197,7 +210,10 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "llama-deploy (local)",
                 "options": {"baseURL": f"{gateway}/v1", "apiKey": "{env:LLAMA_DEPLOY_API_KEY}"},
-                "models": {alias: {"name": "本地模型", "limit": {
+                "models": {alias: {"name": "本地模型", "attachment": bool(vision),
+                                   "modalities": {"input": ["text", "image"] if vision else ["text"],
+                                                  "output": ["text"]},
+                                   "limit": {
                     "context": n_ctx, "output": max(4096, min(32768, n_ctx // 4))}}},
             }},
             "model": f"llama-deploy/{alias}",
@@ -211,7 +227,7 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
         metadata = {f"openai/{alias}": {
             "max_input_tokens": n_ctx, "max_tokens": max(4096, min(32768, n_ctx // 4)),
             "input_cost_per_token": 0, "output_cost_per_token": 0,
-            "litellm_provider": "openai", "mode": "chat",
+            "litellm_provider": "openai", "mode": "chat", "supports_vision": bool(vision),
         }}
         (home / "model-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     elif agent == "gemini":

@@ -19,23 +19,33 @@ IS_WIN = platform.system() == "Windows"
 AGENTS = {
     # Qwen Code 是 Qwen 官方的 CLI agent，工具调用格式针对 Qwen 系列调过，本地跑 Qwen 模型首选
     "qwen": {"name": "Qwen Code", "command": "qwen", "tag": "推荐",
+             "desc": "Qwen 官方出品，工具调用针对 Qwen 模型调优；能写代码、读写文件、执行命令，开「看图」后可操作桌面软件",
              "install": "npm install -g @qwen-code/qwen-code@latest"},
     "claude": {"name": "Claude Code", "command": "claude",
+               "desc": "Anthropic 出品，功能最全的编程 agent（子任务、计划模式、MCP）；提示词较长，本地模型下偶尔会在同一条命令上反复重试",
                "install": "npm install -g @anthropic-ai/claude-code"},
     "codex": {"name": "Codex", "command": "codex",
+              "desc": "OpenAI 出品，偏重在沙箱里改代码、跑命令，操作前会征求确认",
               "install": "npm install -g @openai/codex"},
     # 提示词针对 Gemini 模型调过：实测本地 Qwen 工具调用 3 次成功 2 次，偶尔把文件写到它的临时目录
     "gemini": {"name": "Gemini CLI", "command": "gemini", "tag": "不推荐",
+               "desc": "Google 出品；提示词针对 Gemini 调优，本地 Qwen 下偶尔把文件写到它自己的临时目录（Qwen Code 是它的 Qwen 调优分支）",
                "install": "npm install -g @google/gemini-cli"},
     "opencode": {"name": "OpenCode", "command": "opencode",
+                 "desc": "开源、界面美观，内置 plan/build 两种模式，支持任意 OpenAI 兼容模型",
                  "install": "npm install -g opencode-ai@latest"},
     # Aider 以 git 为中心、提示词精简，适合上下文有限的本地模型
     "aider": {"name": "Aider", "command": "aider",
+              "desc": "以 git 为中心的结对编程工具，改动自动提交；提示词精简，适合上下文有限的本地模型；不执行任意命令、不看图",
               "install": "python -m pip install aider-install && aider-install"},
 }
 
 # 启动器里的值会被 cmd 解析，这些字符无法安全地写进 set 语句
 _UNSAFE_CHARS = set('"%\r\n')
+# 窗口标题前缀：「关闭 agent」按它找到本工具打开的窗口
+WINDOW_TITLE_PREFIX = "llama-deploy agent - "
+# cmd 按系统代码页（中文系统为 GBK）解析 .cmd 文件；mbcs 编解码器只在 Windows 上存在
+LAUNCHER_ENCODING = "mbcs" if os.name == "nt" else "utf-8"
 
 
 def find_tool_dirs() -> list:
@@ -57,8 +67,24 @@ def find_tool_dirs() -> list:
     return [max(found, key=version)]
 
 
+def command_path(agent: str):
+    """找到 agent 可执行文件。PATH 里没有时再看常见安装位置：
+
+    aider-install 装到 ~/.local/bin，虽然会改用户 PATH，但已在运行的管理器进程看不到新 PATH，
+    实测装完后界面仍显示"未安装"。
+    """
+    command = AGENTS[agent]["command"]
+    found = shutil.which(command)
+    if found:
+        return Path(found)
+    for candidate in (Path.home() / ".local" / "bin" / (command + (".exe" if IS_WIN else "")),):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def installed(agent: str) -> bool:
-    return shutil.which(AGENTS[agent]["command"]) is not None
+    return command_path(agent) is not None
 
 
 def agent_home(base_dir: Path, agent: str) -> Path:
@@ -177,6 +203,8 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
             "model": f"llama-deploy/{alias}",
             # 标题生成等后台任务也走本地模型，不去连云端
             "small_model": f"llama-deploy/{alias}",
+            # 快照会对整个工作目录做 git 备份：实测工作目录是用户主目录时一直卡在快照、毫无反应
+            "snapshot": False,
         }
         (home / "opencode.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     elif agent == "aider":
@@ -199,8 +227,27 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int):
         path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def default_workspace() -> Path:
+    """agent 默认工作目录。不用用户主目录：agent 会扫描/快照整个工作目录，主目录太大。"""
+    return Path.home() / "llama-agent-workspace"
+
+
+def workspace_warning(path: Path) -> str:
+    """工作目录过大（用户主目录、盘符根目录）时返回提示；正常返回空字符串。"""
+    resolved = path.resolve()
+    if resolved == Path.home().resolve():
+        return "工作目录是整个用户目录：agent 会扫描其中所有文件，OpenCode 等会因此长时间无响应，建议换成具体的项目文件夹"
+    if resolved.parent == resolved:
+        return "工作目录是整个磁盘根目录：agent 会扫描整盘文件，建议换成具体的项目文件夹"
+    return ""
+
+
 def validate_cwd(cwd: str) -> Path:
-    path = Path(os.path.expanduser(cwd or "~")).resolve()
+    if not (cwd or "").strip():
+        path = default_workspace()
+        path.mkdir(parents=True, exist_ok=True)
+        return path.resolve()
+    path = Path(os.path.expanduser(cwd)).resolve()
     if not path.is_dir():
         raise ValueError(f"工作目录不存在: {path}")
     if _UNSAFE_CHARS & set(str(path)):
@@ -219,7 +266,9 @@ def write_launcher(base_dir: Path, agent: str, env: dict, cwd: Path, args: list 
     out_dir = base_dir / "agents"
     out_dir.mkdir(parents=True, exist_ok=True)
     if IS_WIN:
-        lines = ["@echo off", "chcp 65001 >nul", f"title {name} · 本地模型 (llama-deploy)"]
+        # 不切换到 UTF-8 代码页（chcp 65001）：Windows 10 旧版控制台在该模式下，Qwen Code 这类
+        # 全屏终端界面写屏会报 "write UNKNOWN" 直接闪退。启动器改用系统代码页（中文系统为 GBK）保存。
+        lines = ["@echo off", f"title {WINDOW_TITLE_PREFIX}{name}"]
         lines += [f'set "{k}={v}"' for k, v in env.items()]
         # cmd 的 cd 不会更新 PWD；从 Git Bash 等环境继承来的旧 PWD 会让部分工具
         # （实测 OpenCode）把文件写到启动管理器的目录，而不是用户选的工作目录
@@ -232,7 +281,9 @@ def write_launcher(base_dir: Path, agent: str, env: dict, cwd: Path, args: list 
                   f"echo {name} 正在使用本地模型（仅此窗口生效；平时直接运行 {base_command} 仍走官方）",
                   command]
         path = out_dir / f"launch-{agent}.cmd"
-        path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        # newline="" 原样写入：否则 Windows 文本模式会把 \n 再转一次，变成 \r\r\n
+        with open(path, "w", encoding=LAUNCHER_ENCODING, errors="replace", newline="") as f:
+            f.write("\r\n".join(lines) + "\r\n")
     else:
         import shlex
         lines = ["#!/bin/sh"]
@@ -258,3 +309,34 @@ def open_terminal(launcher: Path):
             subprocess.Popen([term, "-e", str(launcher)])
             return
     raise RuntimeError(f"未找到图形终端，请手动运行: {launcher}")
+
+
+def agent_window_pids(base_dir: Path) -> list:
+    """本工具打开的 agent 窗口（cmd.exe /k <base>\\agents\\launch-*.cmd）的 PID。
+
+    按命令行识别而不是窗口标题：Qwen Code 等启动后会改写窗口标题（实测变成 "npm view ..."）。
+    """
+    if not IS_WIN:
+        return []
+    marker = str(base_dir / "agents" / "launch-").lower()
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
+              "ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, errors="replace", timeout=20).stdout
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        pid, _, cmdline = line.partition("|")
+        if pid.strip().isdigit() and marker in cmdline.lower():
+            pids.append(int(pid))
+    return pids
+
+
+def close_agent_windows(base_dir: Path) -> int:
+    """关闭本工具打开的 agent 窗口，连同窗口里的 agent 进程树。返回关闭的窗口数。"""
+    pids = agent_window_pids(base_dir)
+    for pid in pids:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+    return len(pids)

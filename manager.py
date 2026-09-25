@@ -51,7 +51,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -758,6 +758,16 @@ def latest_llama_release() -> dict:
         value["error"] = f"无法检查最新版本: {e}"
     LATEST_LLAMA_CACHE.update({"value": value, "ts": now})
     return value
+
+
+def read_server_mode() -> dict:
+    """run.py 启动服务时记录的模式（vision / agent）；PID 对不上说明是过期记录。"""
+    try:
+        mode = json.loads((BASE_DIR / ".llama-server.mode.json").read_text(encoding="utf-8"))
+        pid = PID_FILE.read_text(encoding="utf-8").strip() if PID_FILE.exists() else ""
+        return mode if str(mode.get("pid")) == pid else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def agents_launcher_path(agent: str) -> Path:
@@ -1478,11 +1488,12 @@ class DeployManager:
     agent_state = {"agent": "", "state": "idle", "message": ""}
 
     def list_agents(self) -> dict:
-        items = [{"id": key, "name": info["name"], "tag": info.get("tag", ""), "installed": agents.installed(key),
+        items = [{"id": key, "name": info["name"], "tag": info.get("tag", ""), "desc": info.get("desc", ""),
+                  "installed": agents.installed(key),
                   "install": info["install"],
                   "launcher": str(agents_launcher_path(key))} for key, info in agents.AGENTS.items()]
         return {"agents": items, "state": dict(self.agent_state),
-                "default_cwd": str(Path.home())}
+                "default_cwd": str(agents.default_workspace())}
 
     def launch_agent(self, agent: str, cwd: str, vision: bool = False) -> dict:
         if agent not in agents.AGENTS:
@@ -1518,15 +1529,16 @@ class DeployManager:
             cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
             port = int(cfg.get("server", {}).get("port", 8080) or 8080)
             running = self.get_server_status().get("server_running")
-            if running and self._server_has_vision(port) not in (None, vision):
-                # 已在运行的服务与所需模式不一致（要看图却是纯文本，或反之）：切换模式
-                step("正在切换模型服务的视觉模式...")
+            mode = read_server_mode()
+            if running and (mode.get("agent") is not True or bool(mode.get("vision")) != vision):
+                # 已在运行的服务不是 agent 模式（聊天配置上下文太小），或视觉开关不一致：切换
+                step("正在把模型服务切换到 agent 模式（长上下文）...")
                 self.stop_server()
                 running = False
             if not running:
-                step("正在启动模型服务（首次加载约 10-60 秒）..." if not vision
-                     else "正在启动带视觉的模型服务（视觉模块放 CPU，不占显存）...")
-                started = self.start_server(vision)
+                step("正在启动 agent 模式的模型服务（约 10-60 秒）..." if not vision
+                     else "正在启动 agent 模式的模型服务（含看图，视觉模块放 CPU，不占显存）...")
+                started = self.start_server(vision, agent=True)
                 if started.get("status") != "ok":
                     raise RuntimeError(started.get("message", "模型服务启动失败"))
             step("等待模型加载完成...")
@@ -1554,19 +1566,31 @@ class DeployManager:
             home = agents.agent_home(BASE_DIR, agent)
             agents.prepare_home(agent, home, gateway, alias, n_ctx)
             env = agents.build_env(agent, home, gateway, alias, api_key, n_ctx)
+            # agent 自己的目录也加进 PATH：不在 PATH 里的安装位置（如 ~/.local/bin）同样能启动
+            exe_dir = [agents.command_path(agent).parent] if agents.command_path(agent) else []
             launcher = agents.write_launcher(BASE_DIR, agent, env, workdir,
                                              agents.command_args(agent, home, alias),
-                                             agents.find_tool_dirs())
+                                             exe_dir + agents.find_tool_dirs())
             agents.open_terminal(launcher)
             note = ""
-            if n_ctx and n_ctx < 65536 and agent in ("claude", "codex", "qwen", "gemini", "opencode"):
-                note = (f"；当前上下文仅 {n_ctx}，agent 的系统提示与工具定义约占 1-2 万 token，"
-                        "建议选用长上下文方案")
+            if n_ctx and n_ctx < 60000 and agent in ("claude", "codex", "qwen", "gemini", "opencode"):
+                note = (f"；当前上下文仅 {n_ctx}，agent 的系统提示与工具定义约占 2-3 万 token，"
+                        "很快就会触发压缩。可关闭占用显存的程序后重试以获得更长上下文")
+            warn = agents.workspace_warning(workdir)
+            if warn:
+                note += "；⚠️ " + warn
             self.agent_state = {"agent": agent, "state": "opened",
                                 "message": f"已在新窗口打开 {name}（上下文 {n_ctx}）{note}。"
                                            f"以后也可直接双击 {launcher}"}
         except Exception as e:
             self.agent_state = {"agent": agent, "state": "error", "message": f"{name} 启动失败: {e}"}
+
+    def close_agents(self) -> dict:
+        closed = agents.close_agent_windows(BASE_DIR)
+        stopped = self.stop_server()
+        self.agent_state = {"agent": "", "state": "idle", "message": ""}
+        return {"status": "ok",
+                "message": f"已关闭 {closed} 个 agent 窗口；{stopped.get('message', '')}".strip()}
 
     def rollback_llama(self):
         running = running_llama_processes()
@@ -1778,7 +1802,7 @@ class DeployManager:
         status.update(self._compat_status(config))
         return status
 
-    def start_server(self, vision: bool = False):
+    def start_server(self, vision: bool = False, agent: bool = False):
         st = self.get_server_status()
         if st["server_running"]:
             return {"status": "error", "message": "服务器已在运行"}
@@ -1786,6 +1810,8 @@ class DeployManager:
         cmd = [sys.executable, str(BASE_DIR / "run.py"), "server", "--background"]
         if vision:
             cmd.append("--vision")
+        if agent:
+            cmd.append("--agent")
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -2262,6 +2288,8 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             self._json_resp(deploy_mgr.upgrade_llama())
         elif path == "/api/llama/rollback":
             self._json_resp(deploy_mgr.rollback_llama())
+        elif path == "/api/agents/close":
+            self._json_resp(deploy_mgr.close_agents())
         elif path == "/api/agents/launch":
             self._json_resp(deploy_mgr.launch_agent(str(data.get("agent", "")), str(data.get("cwd", "")),
                                                     bool(data.get("vision"))))
@@ -2718,14 +2746,22 @@ a{color:var(--primary);text-decoration:none}
         </div>
       </div>
       <div class="card">
+        <div class="card-title">🎯 使用场景（推荐从这里选）</div>
+        <div class="form-hint">按用途选一套配置，会自动填好下方「高级性能」里的各项参数；点「保存配置」并重启模型服务后生效。
+          括号里是参考数据（RTX 5060 Ti 16GB + Qwen3.8-27B UD-IQ4_XS 实测），不同显卡和模型会有差异。
+          「一键启动 Agent」会自动使用长上下文配置，不受这里影响。</div>
+        <div id="presetCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:10px"></div>
+      </div>
+      <div class="card">
         <div class="card-title">⚡ 高级性能</div>
         <div class="form-row">
           <div class="form-group">
             <label class="form-label" for="cfg-performance_profile">性能策略</label>
             <select class="form-input" id="cfg-performance_profile">
-              <option value="auto">自动适配</option>
-              <option value="maximum">极限性能</option>
-              <option value="compatible">兼容优先</option>
+              <option value="speed">极速（MTP 推测解码）</option>
+              <option value="balanced">平衡（q8 KV，输出逐字节无损）</option>
+              <option value="quality">质量（f16 KV）</option>
+              <option value="compatible">兼容（老旧显卡/驱动）</option>
             </select>
           </div>
           <div class="form-group">
@@ -2737,9 +2773,10 @@ a{color:var(--primary);text-decoration:none}
           <div class="form-group">
             <label class="form-label" for="cfg-spec_type">Speculative / MTP</label>
             <select class="form-input" id="cfg-spec_type">
+              <option value="auto">跟随性能策略（极速档开 MTP）</option>
+              <option value="ngram">ngram（无损、不占显存）</option>
+              <option value="draft-mtp">draft-mtp（最快，需额外显存）</option>
               <option value="off">关闭</option>
-              <option value="draft-mtp">draft-mtp</option>
-              <option value="auto">自动检测</option>
             </select>
           </div>
           <div class="form-group">
@@ -2818,10 +2855,13 @@ a{color:var(--primary);text-decoration:none}
           <input class="form-input" id="agentCwd" type="text" placeholder="例如 D:\projects\my-app">
         </div>
         <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px;cursor:pointer">
-          <input type="checkbox" id="agentVision"> 需要看图（截图、视频画面等）：视觉模块放 CPU，不占显存、不缩上下文，每张图多花几秒
+          <input type="checkbox" id="agentVision" checked> 允许看图（截图、操作桌面软件、视频画面等）：视觉模块放 CPU，不占显存、不缩上下文，每张图多花几秒
         </label>
         <div id="agentButtons" style="display:flex;gap:10px;flex-wrap:wrap">加载中...</div>
         <div id="agentState" class="form-hint" style="margin-top:8px"></div>
+        <div style="margin-top:10px">
+          <button class="btn btn-ghost" onclick="closeAgents()">⏹️ 关闭 agent 窗口并释放显存</button>
+        </div>
       </div>
       <div class="card">
         <div class="card-title">🌐 局域网与兼容网关</div>
@@ -2943,6 +2983,7 @@ async function init(){
     (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
   await loadDefaultCfg();
   loadConfig();pollStatus();updateSystemPage();loadEngineInfo();loadAgents();
+  document.addEventListener('change',function(e){if(e.target&&e.target.id&&e.target.id.indexOf('cfg-')===0)renderPresets()});
   var vram=sysInfo.gpu_vram_mb||0;
   var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
   deviceRec=rec;
@@ -3448,6 +3489,46 @@ async function deleteModel(filename){
 }
 
 // ===== 配置 =====
+var PRESETS=[
+  {id:'chat',name:'💬 日常对话（推荐）',ref:'约 2.2 万上下文 · 40–55 t/s',
+   desc:'MTP 推测解码，速度最快。每个 token 都由主模型验证，不降智，但输出与不开时不逐字相同。',
+   v:{'cfg-performance_profile':'speed','cfg-spec_type':'auto','cfg-spec_draft_n_max':2,'cfg-cache_type_k':'q8_0','cfg-cache_type_v':'q8_0','cfg-ctx_size':0}},
+  {id:'long',name:'📚 长对话 / 长文档',ref:'约 5.1 万上下文 · 27 t/s',
+   desc:'不开 MTP，KV 用 q8（几乎无损），输出与参考解码逐字节一致；ngram 推测解码不占显存。',
+   v:{'cfg-performance_profile':'balanced','cfg-spec_type':'ngram','cfg-cache_type_k':'q8_0','cfg-cache_type_v':'q8_0','cfg-ctx_size':0}},
+  {id:'xlong',name:'🗂️ 超长上下文',ref:'约 8.8 万上下文 · 短对话 27 t/s，7 万时约 16 t/s',
+   desc:'KV 压到 q4 换取最长上下文，长上下文下精度略有损失。agent 模式用的就是这一套。',
+   v:{'cfg-performance_profile':'balanced','cfg-spec_type':'ngram','cfg-cache_type_k':'q4_0','cfg-cache_type_v':'q4_0','cfg-ctx_size':0}},
+  {id:'quality',name:'🎯 质量优先',ref:'约 2.7 万上下文 · 27 t/s',
+   desc:'KV 全精度（f16），不做任何推测解码，适合对输出一致性要求最高的场合。',
+   v:{'cfg-performance_profile':'quality','cfg-spec_type':'off','cfg-cache_type_k':'f16','cfg-cache_type_v':'f16','cfg-ctx_size':0}}
+];
+function currentPreset(){
+  for(var i=0;i<PRESETS.length;i++){
+    var ok=true,v=PRESETS[i].v;
+    for(var k in v){if(k==='cfg-spec_draft_n_max'&&getVal('cfg-spec_type')!=='auto')continue;if(String(getVal(k))!==String(v[k])){ok=false;break}}
+    if(ok)return PRESETS[i].id;
+  }
+  return '';
+}
+function renderPresets(){
+  var box=document.getElementById('presetCards');if(!box)return;
+  var cur=currentPreset();
+  box.innerHTML=PRESETS.map(function(p){
+    var on=p.id===cur;
+    return '<div role="button" tabindex="0" onclick="applyPreset('+esc(JSON.stringify(p.id))+')" style="cursor:pointer;border-radius:8px;padding:10px;border:2px solid '+(on?'var(--accent,#3b82f6)':'var(--border)')+';background:var(--bg3)">'+
+      '<div style="font-weight:600">'+esc(p.name)+(on?' ✅':'')+'</div>'+
+      '<div class="tag tag-blue" style="margin:6px 0;display:inline-block">'+esc(p.ref)+'</div>'+
+      '<div class="form-hint">'+esc(p.desc)+'</div></div>';
+  }).join('')+(cur?'':'<div class="form-hint">当前为自定义参数（不对应任何预设）。</div>');
+}
+function applyPreset(id){
+  var p=PRESETS.filter(function(x){return x.id===id})[0];if(!p)return;
+  for(var k in p.v)setVal(k,p.v[k]);
+  renderPresets();
+  showToast('已套用「'+p.name.replace(/^\S+\s/,'')+'」，点「保存配置」并重启模型服务后生效',5000);
+}
+
 async function loadConfig(){
   currentConfig=await api('/api/config');
   if(!currentConfig||currentConfig.error||!currentConfig.model)currentConfig=defaultCfg();
@@ -3460,10 +3541,12 @@ async function loadConfig(){
   setVal('cfg-reasoning_budget',s.reasoning_budget!=null?s.reasoning_budget:512);
   setVal('cfg-temperature',sp.temperature);setVal('cfg-top_k',sp.top_k);
   setVal('cfg-top_p',sp.top_p);setVal('cfg-presence_penalty',sp.presence_penalty);
-  setVal('cfg-spec_type',p.spec_type||'off');setVal('cfg-spec_draft_n_max',p.spec_draft_n_max!=null?p.spec_draft_n_max:2);
-  setVal('cfg-performance_profile',p.profile||'auto');setVal('cfg-fit_target_mb',p.fit_target_mb!=null?p.fit_target_mb:0);
+  setVal('cfg-spec_type',p.spec_type==='ngram-map-k'?'ngram':(p.spec_type||'auto'));setVal('cfg-spec_draft_n_max',p.spec_draft_n_max!=null?p.spec_draft_n_max:2);
+  var prof=({auto:'balanced',maximum:'balanced','质量':'quality','平衡':'balanced','极速':'speed'})[p.profile]||p.profile||'balanced';
+  setVal('cfg-performance_profile',prof);setVal('cfg-fit_target_mb',p.fit_target_mb!=null?p.fit_target_mb:0);
   setVal('cfg-cache_type_k',p.cache_type_k||'auto');setVal('cfg-cache_type_v',p.cache_type_v||'auto');
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
+  renderPresets();
   var bk=document.getElementById('cfg-gpu_backend');if(bk)bk.value=g.backend||'auto';
   var glVal=g.gpu_layers!=null?g.gpu_layers:-1;
   setVal('cfg-gpu_layers',glVal);
@@ -3503,9 +3586,9 @@ async function saveConfig(){
   var oldCompat=(currentConfig&&currentConfig.compat)||defaultCfg().compat;
   var serverPort=getNum('cfg-port',8080);
   oldCompat.upstream_url='http://127.0.0.1:'+serverPort;
-  oldPerf.spec_type=getVal('cfg-spec_type')||'off';
+  oldPerf.spec_type=getVal('cfg-spec_type')||'auto';
   oldPerf.spec_draft_n_max=getNum('cfg-spec_draft_n_max',2);
-  oldPerf.profile=getVal('cfg-performance_profile')||'auto';
+  oldPerf.profile=getVal('cfg-performance_profile')||'balanced';
   oldPerf.fit_target_mb=getNum('cfg-fit_target_mb',0);
   oldPerf.cache_type_k=getVal('cfg-cache_type_k')||'auto';
   oldPerf.cache_type_v=getVal('cfg-cache_type_v')||'auto';
@@ -3588,10 +3671,13 @@ async function loadAgents(){
   var r=await api('/api/agents');if(!r||!r.agents){box.textContent='无法读取 agent 列表';return}
   var cwd=document.getElementById('agentCwd');
   if(cwd&&!cwd.value){var saved='';try{saved=localStorage.getItem('agentCwd')||''}catch(e){}cwd.value=saved||r.default_cwd||''}
+  box.style.display='grid';box.style.gridTemplateColumns='repeat(auto-fit,minmax(260px,1fr))';
   box.innerHTML=r.agents.map(function(a){
-    return a.installed
+    var btn=a.installed
       ?'<button class="btn '+(a.tag==='不推荐'?'btn-ghost':'btn-primary')+'" onclick="launchAgent('+esc(JSON.stringify(a.id))+')">▶️ '+esc(a.name)+(a.tag?'（'+esc(a.tag)+'）':'')+'</button>'
       :'<button class="btn btn-ghost" title="'+esc(a.install)+'" onclick="copyText('+esc(JSON.stringify(a.install))+')">'+esc(a.name)+'（未安装，复制安装命令）</button>';
+    return '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px">'+btn+
+      '<div class="form-hint" style="margin-top:6px">'+esc(a.desc||'')+'</div></div>';
   }).join('');
   renderAgentState(r.state);
 }
@@ -3603,6 +3689,11 @@ function renderAgentState(st){
       var r=await api('/api/agents');if(r&&r.state)renderAgentState(r.state);
     },2000);
   }else if(agentPollTimer){clearInterval(agentPollTimer);agentPollTimer=null;pollStatus();}
+}
+async function closeAgents(){
+  if(!confirm('关闭本工具打开的所有 agent 窗口，并停止模型服务释放显存？'))return;
+  var r=await api('/api/agents/close','POST');
+  showToast((r&&r.message)||'操作完成',5000);renderAgentState({state:'idle'});setTimeout(pollStatus,1000);
 }
 async function launchAgent(id){
   var cwd=(document.getElementById('agentCwd').value||'').trim();

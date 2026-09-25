@@ -29,6 +29,8 @@ LLAMA_DIR = BASE_DIR / "llama.cpp"
 MODELS_DIR = BASE_DIR / "models"
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
+# 当前服务以什么模式启动（视觉 / agent），管理器据此判断是否需要切换
+MODE_FILE = BASE_DIR / ".llama-server.mode.json"
 LOG_FILE = BASE_DIR / ".llama-server.log"
 IS_WIN = platform.system() == "Windows"
 HELP_CACHE = {}
@@ -1136,12 +1138,23 @@ def _safe_int_min(val, default: int, minimum: int) -> int:
         return default
 
 
-def runtime(cfg: dict, mode: str, vision=False) -> dict:
+# agent 模式的覆盖项（只影响这一次启动，不改 config.jsonc）。
+# 实测 47K 上下文对 agent 不可用：Qwen Code 固定预留 2 万摘要输出 + 1.3 万缓冲，
+# 47104 的窗口 1.4 万就开始压缩、2.4 万即硬上限，而它的系统提示+工具定义+技能就有约 2.8 万。
+# 去掉 MTP（草稿层与循环状态拷贝约占 1GB）并用 q4 KV，16GB 卡上自动上下文约 8.8 万；
+# ngram 推测解码无损、不占显存，agent 复读/改写代码时命中率高。
+AGENT_OVERRIDES = {"spec_type": "ngram", "cache_type_k": "q4_0", "cache_type_v": "q4_0"}
+
+
+def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     sc  = cfg.get("server", {})
     sp  = cfg.get("sampling", {})
     gc  = cfg.get("gpu", {})
     mc  = cfg.get("model", {})
     pc  = cfg.get("performance", {})
+    if agent:
+        pc = {**pc, **AGENT_OVERRIDES}
+        sc = {**sc, "ctx_size": 0}
 
     binary = find_binary("llama-cli" if mode == "chat" else "llama-server")
     if not binary.exists():
@@ -1233,6 +1246,7 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
     mtp_available = has_mtp_head(model)
     spec_mtp_supported = supports(binary, "--spec-type") and "draft-mtp" in help_text(binary)
     spec_mtp_enabled = False
+    spec_ngram_enabled = False
     if mode == "server" and spec_requested:
         if vision and tuning["mmproj_offload"]:
             warn.append("mmproj 驻留 GPU 时显存余量不足，已跳过 MTP；"
@@ -1254,6 +1268,9 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
                 )
             elif spec_setting not in ("auto", "true", "on", "1"):
                 warn.append("已请求 MTP，但当前模型或 llama.cpp 不支持 draft-mtp，已跳过")
+        elif spec_setting in ("ngram", "ngram-map-k"):
+            # 只用 ngram：实测无损（贪心解码 3/3 一致）、不占显存；agent 复读/改写代码时命中率高
+            spec_ngram_enabled = "ngram-map-k" in help_text(binary)
         else:
             warn.append(f"未知 speculative 类型: {spec_setting}，已跳过")
 
@@ -1393,6 +1410,8 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
                 args += ["--spec-draft-ngl", str(pc.get("spec_draft_ngl", "auto") or "auto")]
             if pc.get("ctx_checkpoints", None) is not None and supports(binary, "--ctx-checkpoints"):
                 args += ["--ctx-checkpoints", str(_safe_int(pc.get("ctx_checkpoints"), 32))]
+        elif spec_ngram_enabled:
+            args += ["--spec-type", "ngram-map-k"]
         if not vision and supports(binary, "--no-mmproj"):
             args.append("--no-mmproj")
         if vision and mmproj and mmproj.exists():
@@ -1530,11 +1549,11 @@ def cmd_chat(cfg: dict) -> int:
     except FileNotFoundError as e: print(f"启动失败: {e}"); return 1
 
 
-def cmd_server(cfg: dict, vision=False) -> int:
+def cmd_server(cfg: dict, vision=False, agent=False) -> int:
     if leftover := wait_for_vram_release():
         print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
               "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
-    rt = runtime(cfg, "server", vision)
+    rt = runtime(cfg, "server", vision, agent)
     print("启动 API 服务...")
     summary(rt, "server", vision)
     print(f"   日志: {LOG_FILE}")
@@ -1550,6 +1569,7 @@ def cmd_server(cfg: dict, vision=False) -> int:
             cwd=rt["cwd"],
         )
         PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+        MODE_FILE.write_text(json.dumps({"pid": proc.pid, "vision": bool(vision), "agent": bool(agent)}), encoding="utf-8")
         print(f"   PID: {proc.pid}")
 
         for raw in iter(proc.stdout.readline, b""):
@@ -1596,11 +1616,11 @@ def cmd_server(cfg: dict, vision=False) -> int:
         PID_FILE.unlink(missing_ok=True)
 
 
-def cmd_server_background(cfg: dict, vision=False) -> int:
+def cmd_server_background(cfg: dict, vision=False, agent=False) -> int:
     if leftover := wait_for_vram_release():
         print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
               "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
-    rt = runtime(cfg, "server", vision)
+    rt = runtime(cfg, "server", vision, agent)
     summary(rt, "server", vision)
     try:
         log_f = open(LOG_FILE, "w", encoding="utf-8")
@@ -1626,6 +1646,7 @@ def cmd_server_background(cfg: dict, vision=False) -> int:
 
         proc = subprocess.Popen(rt["args"], **popen_kwargs)
         PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+        MODE_FILE.write_text(json.dumps({"pid": proc.pid, "vision": bool(vision), "agent": bool(agent)}), encoding="utf-8")
 
         # 等待 3 秒确认进程未立即退出
         time.sleep(3)
@@ -1817,7 +1838,11 @@ def main() -> int:
         print("找不到或无法解析 config.jsonc"); return 1
     try:
         if args[0].lower() == "chat": return cmd_chat(cfg)
-        if args[0].lower() == "server": return cmd_server_background(cfg, "--vision" in args or "-v" in args) if ("--background" in args or "-bg" in args) else cmd_server(cfg, "--vision" in args or "-v" in args)
+        if args[0].lower() == "server":
+            vision, agent = ("--vision" in args or "-v" in args), "--agent" in args
+            if "--background" in args or "-bg" in args:
+                return cmd_server_background(cfg, vision, agent)
+            return cmd_server(cfg, vision, agent)
         if args[0].lower() == "stop": return cmd_stop()
         if args[0].lower() == "status": return cmd_status(cfg)
         if args[0].lower() == "benchmark": return cmd_benchmark(cfg, "--sweep" in args)

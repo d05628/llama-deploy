@@ -41,6 +41,7 @@ temp/
 *.log
 log.txt
 *.pid
+.llama-server.mode.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

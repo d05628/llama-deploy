@@ -54,14 +54,32 @@ class AgentIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agents, "IS_WIN", True):
             base = Path(tmp)
             env = agents.build_env("claude", base / "agents" / "claude", GATEWAY, "local", "k", 47104)
-            text = agents.write_launcher(base, "claude", env, base).read_text(encoding="utf-8")
+            text = agents.write_launcher(base, "claude", env, base).read_text(encoding=agents.LAUNCHER_ENCODING)
         self.assertIn('set "ANTHROPIC_API_KEY="', text)
         # 继承来的 PWD 会让 OpenCode 写错目录
         self.assertIn(f'set "PWD={base}"', text)
         self.assertIn('set "ANTHROPIC_BASE_URL=http://127.0.0.1:11434"', text)
+        # 不切 UTF-8 代码页：旧版控制台下 Qwen Code 会报 "write UNKNOWN" 闪退
+        self.assertNotIn("chcp 65001", text)
+        # 窗口标题带前缀，「关闭 agent」靠它识别本工具打开的窗口
+        self.assertIn("title " + agents.WINDOW_TITLE_PREFIX, text)
         # 不用 setx，不写注册表：只影响这个 cmd 进程
         self.assertNotIn("setx", text.lower())
         self.assertNotIn("reg add", text.lower())
+
+    def test_default_workspace_is_not_the_home_folder(self):
+        # 默认用整个用户目录时，OpenCode 一直卡在给整个目录做快照
+        self.assertNotEqual(agents.default_workspace().resolve(), Path.home().resolve())
+        self.assertTrue(agents.workspace_warning(Path.home()))
+        self.assertTrue(agents.workspace_warning(Path(Path.home().anchor)))
+        self.assertEqual(agents.workspace_warning(agents.default_workspace()), "")
+
+    def test_opencode_snapshots_are_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "opencode"
+            agents.prepare_home("opencode", home, GATEWAY, "local", 88064)
+            config = json.loads((home / "opencode.json").read_text(encoding="utf-8"))
+        self.assertIs(config["snapshot"], False)
 
     def test_unsafe_working_directory_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

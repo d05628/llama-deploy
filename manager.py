@@ -39,6 +39,8 @@ import subprocess
 import threading
 import time
 import unicodedata
+
+import agents
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,7 +51,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -59,6 +61,9 @@ LLAMA_DIR = BASE_DIR / "llama.cpp"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_PORT = 9090
 LLAMA_VERSION_CACHE = {"key": None, "value": None, "ts": 0.0}
+LLAMA_PREVIOUS_DIR = BASE_DIR / "llama.cpp.previous"
+ENGINE_INFO_NAME = ".llama-deploy.json"   # deploy.py 安装时写入的包信息
+LATEST_LLAMA_CACHE = {"value": None, "ts": 0.0}
 
 # 管理器可以启动/停止进程、改配置、删模型，因此每次启动生成一枚会话令牌，
 # 只随页面本体下发。同源脚本读得到，其它站点的脚本读不到，以此挡住 CSRF。
@@ -128,7 +133,7 @@ def default_config():
             "host": "0.0.0.0",
             "port": 8080,
             "threads": 0,         # 0 = run.py 自动计算（物理核数）
-            "ctx_size": 8192,
+            "ctx_size": 0,
             "enable_thinking": False,
             "reasoning_budget": 512,
         },
@@ -168,7 +173,8 @@ def default_config():
             "cache_type_k": "auto",
             "cache_type_v": "auto",
             "spec_type": "off",
-            "spec_draft_n_max": 3,
+            "spec_draft_n_max": 2,
+            "min_ctx_size": 8192,
             "spec_draft_ngl": "auto",
             "allow_experimental_mtp": False,
             "kv_unified": True,
@@ -695,6 +701,80 @@ def get_llama_version() -> dict:
         }
         LLAMA_VERSION_CACHE.update({"key": cache_key, "value": value, "ts": now})
         return dict(value)
+
+
+def _engine_build(engine_dir: Path) -> int:
+    exe = "llama-server.exe" if platform.system() == "Windows" else "llama-server"
+    for candidate in (engine_dir / exe, engine_dir / "build" / "bin" / exe, engine_dir / "bin" / exe):
+        if candidate.exists():
+            try:
+                r = subprocess.run([str(candidate), "--version"], capture_output=True, text=True,
+                                   timeout=10, cwd=str(candidate.parent), encoding="utf-8", errors="replace")
+            except Exception:
+                return 0
+            m = re.search(r"\bbuild\s+(\d+)\b", (r.stdout or "") + (r.stderr or ""))
+            return int(m.group(1)) if m else 0
+    return 0
+
+
+def _engine_variant(engine_dir: Path) -> str:
+    """CUDA 13.4 / CUDA 12.4 / Vulkan / CPU。优先读安装记录，没有则按 DLL 推断。"""
+    try:
+        info = json.loads((engine_dir / ENGINE_INFO_NAME).read_text(encoding="utf-8"))
+        asset = str(info.get("asset", ""))
+        m = re.search(r"cuda-(\d+\.\d+)", asset, re.I)
+        if m:
+            return f"CUDA {m.group(1)}"
+        if "vulkan" in asset.lower():
+            return "Vulkan"
+        if asset:
+            return "CPU"
+    except (OSError, ValueError):
+        pass
+    for dll in engine_dir.glob("cudart64_*.dll"):
+        return f"CUDA {dll.stem.split('_')[-1]}"
+    if any(engine_dir.glob("*vulkan*")):
+        return "Vulkan"
+    return "CUDA" if any(engine_dir.glob("*cuda*")) else ""
+
+
+def latest_llama_release() -> dict:
+    """查询 llama.cpp 最新 release 的构建号，缓存 30 分钟。失败不影响其它功能。"""
+    now = time.time()
+    if LATEST_LLAMA_CACHE["value"] is not None and now - LATEST_LLAMA_CACHE["ts"] < 1800:
+        return LATEST_LLAMA_CACHE["value"]
+    value = {"build": 0, "error": ""}
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "llama-deploy"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+        builds = [int(r["tag_name"][1:]) for r in releases
+                  if not r.get("draft") and re.fullmatch(r"b\d+", str(r.get("tag_name", "")))]
+        value["build"] = max(builds) if builds else 0
+    except Exception as e:
+        value["error"] = f"无法检查最新版本: {e}"
+    LATEST_LLAMA_CACHE.update({"value": value, "ts": now})
+    return value
+
+
+def agents_launcher_path(agent: str) -> Path:
+    return BASE_DIR / "agents" / (f"launch-{agent}.cmd" if platform.system() == "Windows" else f"launch-{agent}.sh")
+
+
+def get_engine_info(check_latest: bool = True) -> dict:
+    current = {"build": _engine_build(LLAMA_DIR), "variant": _engine_variant(LLAMA_DIR)} if LLAMA_DIR.exists() else None
+    previous = ({"build": _engine_build(LLAMA_PREVIOUS_DIR), "variant": _engine_variant(LLAMA_PREVIOUS_DIR)}
+                if LLAMA_PREVIOUS_DIR.exists() else None)
+    latest = latest_llama_release() if check_latest else {"build": 0, "error": ""}
+    return {
+        "current": current,
+        "previous": previous,
+        "latest": latest,
+        "update_available": bool(current and latest.get("build") and latest["build"] > (current.get("build") or 0)),
+    }
 
 
 # ============================================================
@@ -1394,6 +1474,114 @@ class DeployManager:
             "llama.cpp 升级已启动"
         )
 
+    # ---------- 一键启动 agent（Claude Code / Codex / Gemini CLI） ----------
+    agent_state = {"agent": "", "state": "idle", "message": ""}
+
+    def list_agents(self) -> dict:
+        items = [{"id": key, "name": info["name"], "tag": info.get("tag", ""), "installed": agents.installed(key),
+                  "install": info["install"],
+                  "launcher": str(agents_launcher_path(key))} for key, info in agents.AGENTS.items()]
+        return {"agents": items, "state": dict(self.agent_state),
+                "default_cwd": str(Path.home())}
+
+    def launch_agent(self, agent: str, cwd: str, vision: bool = False) -> dict:
+        if agent not in agents.AGENTS:
+            return {"status": "error", "message": f"未知 agent: {agent}"}
+        if not agents.installed(agent):
+            return {"status": "error",
+                    "message": f"未安装 {agents.AGENTS[agent]['name']}，请先运行: {agents.AGENTS[agent]['install']}"}
+        if self.agent_state.get("state") == "starting":
+            return {"status": "error", "message": "上一个 agent 还在启动中，请稍候"}
+        try:
+            workdir = agents.validate_cwd(cwd)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        name = agents.AGENTS[agent]["name"]
+        self.agent_state = {"agent": agent, "state": "starting", "message": f"正在准备 {name}..."}
+        threading.Thread(target=self._launch_agent_worker, args=(agent, workdir, vision), daemon=True).start()
+        return {"status": "ok", "message": f"正在为 {name} 准备本地模型..."}
+
+    def _server_has_vision(self, port: int):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/props", timeout=3) as resp:
+                return bool((json.loads(resp.read().decode("utf-8")).get("modalities") or {}).get("vision"))
+        except Exception:
+            return None
+
+    def _launch_agent_worker(self, agent: str, workdir: Path, vision: bool = False):
+        name = agents.AGENTS[agent]["name"]
+
+        def step(message):
+            self.agent_state = {"agent": agent, "state": "starting", "message": message}
+
+        try:
+            cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
+            port = int(cfg.get("server", {}).get("port", 8080) or 8080)
+            running = self.get_server_status().get("server_running")
+            if running and self._server_has_vision(port) not in (None, vision):
+                # 已在运行的服务与所需模式不一致（要看图却是纯文本，或反之）：切换模式
+                step("正在切换模型服务的视觉模式...")
+                self.stop_server()
+                running = False
+            if not running:
+                step("正在启动模型服务（首次加载约 10-60 秒）..." if not vision
+                     else "正在启动带视觉的模型服务（视觉模块放 CPU，不占显存）...")
+                started = self.start_server(vision)
+                if started.get("status") != "ok":
+                    raise RuntimeError(started.get("message", "模型服务启动失败"))
+            step("等待模型加载完成...")
+            props = None
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/props", timeout=3) as resp:
+                        props = json.loads(resp.read().decode("utf-8"))
+                    break
+                except Exception:
+                    if not self.get_server_status().get("server_running"):
+                        raise RuntimeError("模型服务在加载过程中退出，请查看 .llama-server.log")
+                    time.sleep(2)
+            if props is None:
+                raise RuntimeError("等待模型加载超时")
+            n_ctx = int((props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx") or 0)
+            step("正在启动兼容网关...")
+            gw = self.start_gateway()
+            if gw.get("status") != "ok":
+                raise RuntimeError(gw.get("message", "兼容网关启动失败"))
+            gateway = f"http://127.0.0.1:{gw['gateway_port']}"
+            alias = gw.get("gateway_model_alias") or "llama-deploy-local"
+            api_key = gw.get("gateway_api_key") or "local-no-key-needed"
+            home = agents.agent_home(BASE_DIR, agent)
+            agents.prepare_home(agent, home, gateway, alias, n_ctx)
+            env = agents.build_env(agent, home, gateway, alias, api_key, n_ctx)
+            launcher = agents.write_launcher(BASE_DIR, agent, env, workdir,
+                                             agents.command_args(agent, home, alias),
+                                             agents.find_tool_dirs())
+            agents.open_terminal(launcher)
+            note = ""
+            if n_ctx and n_ctx < 65536 and agent in ("claude", "codex", "qwen", "gemini", "opencode"):
+                note = (f"；当前上下文仅 {n_ctx}，agent 的系统提示与工具定义约占 1-2 万 token，"
+                        "建议选用长上下文方案")
+            self.agent_state = {"agent": agent, "state": "opened",
+                                "message": f"已在新窗口打开 {name}（上下文 {n_ctx}）{note}。"
+                                           f"以后也可直接双击 {launcher}"}
+        except Exception as e:
+            self.agent_state = {"agent": agent, "state": "error", "message": f"{name} 启动失败: {e}"}
+
+    def rollback_llama(self):
+        running = running_llama_processes()
+        if running:
+            return {
+                "status": "error",
+                "message": "请先停止所有 llama.cpp 进程再回退: " + ", ".join(running),
+            }
+        if not LLAMA_PREVIOUS_DIR.exists():
+            return {"status": "error", "message": "没有可回退的上一版本"}
+        return self._start_task(
+            [sys.executable, str(BASE_DIR / "deploy.py"), "--rollback-llama"],
+            "llama.cpp 回退已启动"
+        )
+
     def get_deploy_log(self, since: int = 0) -> dict:
         return {
             "lines": self.deploy_log[since:],
@@ -1677,6 +1865,14 @@ class DeployManager:
 
         PID_FILE.unlink(missing_ok=True)
 
+        # taskkill /F 只是发出终止请求，进程退出、显存归还还要一点时间。
+        # 此时立刻重新启动，--fit 会看到偏少的空闲显存，把层挤到 CPU，
+        # 吐字速度直接掉到满速的 1/3 左右 —— 所以等旧进程真正退出再返回。
+        if killed:
+            deadline = time.time() + 15
+            while time.time() < deadline and llama_server_running():
+                time.sleep(0.5)
+
         if killed:
             return {"status": "ok", "message": "✅ 服务器已停止（已清理所有 llama-server 进程）"}
         else:
@@ -1684,6 +1880,19 @@ class DeployManager:
 # ============================================================
 #  模型库管理
 # ============================================================
+
+def llama_server_running() -> bool:
+    """是否还有任何 llama-server 进程存活（不论是否由本管理器启动）。"""
+    try:
+        if platform.system() == "Windows":
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq llama-server.exe", "/NH"],
+                               capture_output=True, text=True, timeout=5)
+            return "llama-server.exe" in (r.stdout or "").lower()
+        r = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
 
 class ModelLibrary:
     """管理本地已下载的模型"""
@@ -1909,6 +2118,10 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
 
         elif path == "/api/status":
             self._json_resp(deploy_mgr.get_server_status())
+        elif path == "/api/agents":
+            self._json_resp(deploy_mgr.list_agents())
+        elif path == "/api/llama/info":
+            self._json_resp(get_engine_info(params.get("latest", "1") != "0"))
         elif path == "/api/deploy/log":
             since = int(params.get("since", "0"))
             self._json_resp(deploy_mgr.get_deploy_log(since))
@@ -2047,6 +2260,11 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             self._json_resp(deploy_mgr.start_deploy())
         elif path == "/api/llama/update":
             self._json_resp(deploy_mgr.upgrade_llama())
+        elif path == "/api/llama/rollback":
+            self._json_resp(deploy_mgr.rollback_llama())
+        elif path == "/api/agents/launch":
+            self._json_resp(deploy_mgr.launch_agent(str(data.get("agent", "")), str(data.get("cwd", "")),
+                                                    bool(data.get("vision"))))
         elif path == "/api/server/start":
             vision = data.get("vision", False)
             self._json_resp(deploy_mgr.start_server(vision))
@@ -2458,8 +2676,8 @@ a{color:var(--primary);text-decoration:none}
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label" for="cfg-ctx_size">上下文长度 (ctx_size)</label>
-            <input class="form-input" id="cfg-ctx_size" type="number" value="8192">
+            <label class="form-label" for="cfg-ctx_size">上下文长度 (ctx_size，0=按显存自动取最大)</label>
+            <input class="form-input" id="cfg-ctx_size" type="number" value="0">
           </div>
           <div class="form-group">
             <label class="form-label" for="cfg-reasoning_budget">思考预算 (tokens)</label>
@@ -2526,7 +2744,7 @@ a{color:var(--primary);text-decoration:none}
           </div>
           <div class="form-group">
             <label class="form-label" for="cfg-spec_draft_n_max">MTP 草稿长度</label>
-            <input class="form-input" id="cfg-spec_draft_n_max" type="number" value="3">
+            <input class="form-input" id="cfg-spec_draft_n_max" type="number" value="2">
           </div>
         </div>
         <div class="form-row">
@@ -2575,11 +2793,35 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🔧 操作</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn btn-primary" onclick="startDeploy()" id="btnDeploy">📦 一键部署</button>
-          <button class="btn btn-ghost" onclick="upgradeLlama()" id="btnUpgradeLlama">⬆️ 升级 llama.cpp</button>
           <button class="btn btn-success" onclick="startServer(false)">▶️ 启动服务器</button>
           <button class="btn btn-success" onclick="startServer(true)">👁️ 启动视觉服务</button>
           <button class="btn btn-danger" onclick="stopServer()">⏹️ 停止服务器</button>
         </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🧩 推理引擎（llama.cpp）</div>
+        <div id="engineContent">加载中...</div>
+        <div class="form-hint">升级会自动选择与本机显卡、驱动最匹配的包（RTX 50 优先 CUDA 13 原生 sm_120），
+          并在确认新引擎能识别 GPU 后才替换；失败自动回滚，成功后保留上一版本可随时一键回退。</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+          <button class="btn btn-primary" onclick="upgradeLlama()" id="btnUpgradeLlama">⬆️ 一键升级到最新</button>
+          <button class="btn btn-ghost" onclick="rollbackLlama()" id="btnRollbackLlama" disabled>↩️ 回退到上一版本</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🤖 一键启动 Agent（本地模型）</div>
+        <div class="form-hint">自动启动模型服务与兼容网关，并在新窗口打开所选工具。只对这个窗口生效、使用独立配置目录，
+          不改动官方配置和登录；平时直接运行 claude / codex / gemini 等仍走官方通道。
+          跑 Qwen 模型首选 Qwen Code（Qwen 官方出品，工具调用格式针对 Qwen 调优）。</div>
+        <div class="form-group" style="margin-top:10px">
+          <label class="form-label" for="agentCwd">工作目录（agent 在这里读写代码）</label>
+          <input class="form-input" id="agentCwd" type="text" placeholder="例如 D:\projects\my-app">
+        </div>
+        <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px;cursor:pointer">
+          <input type="checkbox" id="agentVision"> 需要看图（截图、视频画面等）：视觉模块放 CPU，不占显存、不缩上下文，每张图多花几秒
+        </label>
+        <div id="agentButtons" style="display:flex;gap:10px;flex-wrap:wrap">加载中...</div>
+        <div id="agentState" class="form-hint" style="margin-top:8px"></div>
       </div>
       <div class="card">
         <div class="card-title">🌐 局域网与兼容网关</div>
@@ -2700,7 +2942,7 @@ async function init(){
     '<div>⚡ CPU: '+sysInfo.cpu_count+' 核</div>'+
     (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
   await loadDefaultCfg();
-  loadConfig();pollStatus();updateSystemPage();
+  loadConfig();pollStatus();updateSystemPage();loadEngineInfo();loadAgents();
   var vram=sysInfo.gpu_vram_mb||0;
   var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
   deviceRec=rec;
@@ -3214,11 +3456,11 @@ async function loadConfig(){
   setVal('cfg-repo_id',m.repo_id);setVal('cfg-model_file',m.model_file);
   setVal('cfg-mmproj_file',m.mmproj_file);setVal('cfg-hf_mirror',d.hf_mirror);
   setVal('cfg-github_mirror',d.github_mirror);setVal('cfg-port',s.port);
-  setVal('cfg-threads',s.threads);setVal('cfg-ctx_size',s.ctx_size!=null?s.ctx_size:8192);
+  setVal('cfg-threads',s.threads);setVal('cfg-ctx_size',s.ctx_size!=null?s.ctx_size:0);
   setVal('cfg-reasoning_budget',s.reasoning_budget!=null?s.reasoning_budget:512);
   setVal('cfg-temperature',sp.temperature);setVal('cfg-top_k',sp.top_k);
   setVal('cfg-top_p',sp.top_p);setVal('cfg-presence_penalty',sp.presence_penalty);
-  setVal('cfg-spec_type',p.spec_type||'off');setVal('cfg-spec_draft_n_max',p.spec_draft_n_max!=null?p.spec_draft_n_max:3);
+  setVal('cfg-spec_type',p.spec_type||'off');setVal('cfg-spec_draft_n_max',p.spec_draft_n_max!=null?p.spec_draft_n_max:2);
   setVal('cfg-performance_profile',p.profile||'auto');setVal('cfg-fit_target_mb',p.fit_target_mb!=null?p.fit_target_mb:0);
   setVal('cfg-cache_type_k',p.cache_type_k||'auto');setVal('cfg-cache_type_v',p.cache_type_v||'auto');
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
@@ -3262,7 +3504,7 @@ async function saveConfig(){
   var serverPort=getNum('cfg-port',8080);
   oldCompat.upstream_url='http://127.0.0.1:'+serverPort;
   oldPerf.spec_type=getVal('cfg-spec_type')||'off';
-  oldPerf.spec_draft_n_max=getNum('cfg-spec_draft_n_max',3);
+  oldPerf.spec_draft_n_max=getNum('cfg-spec_draft_n_max',2);
   oldPerf.profile=getVal('cfg-performance_profile')||'auto';
   oldPerf.fit_target_mb=getNum('cfg-fit_target_mb',0);
   oldPerf.cache_type_k=getVal('cfg-cache_type_k')||'auto';
@@ -3276,7 +3518,7 @@ async function saveConfig(){
            shard_file_sizes:oldModel.shard_file_sizes||undefined,mmproj_map:oldModel.mmproj_map||{}},
     download:{hf_mirror:getVal('cfg-hf_mirror'),github_mirror:getVal('cfg-github_mirror'),timeout:300,retries:3},
      server:{host:'0.0.0.0',port:serverPort,threads:getNum('cfg-threads',0),
-             ctx_size:getNum('cfg-ctx_size',2048),
+             ctx_size:getNum('cfg-ctx_size',0),
              enable_thinking:document.getElementById('cfg-thinking').classList.contains('on'),
              reasoning_budget:getNum('cfg-reasoning_budget',512)},
      compat:oldCompat,
@@ -3318,10 +3560,79 @@ async function startDeploy(){
   startLogPoll();
 }
 
+function engineLabel(e){
+  if(!e)return '未安装';
+  return (e.build?'b'+e.build:'未知版本')+(e.variant?' · '+esc(e.variant):'');
+}
+async function loadEngineInfo(){
+  var box=document.getElementById('engineContent');if(!box)return;
+  var r=await api('/api/llama/info');
+  if(!r||r.status==='error'){box.textContent='无法读取引擎信息';return}
+  var latest=r.latest||{};
+  var latestHtml=latest.build
+    ?('b'+latest.build+(r.update_available?' <span class="tag tag-green">可升级</span>':' <span class="tag tag-blue">已是最新</span>'))
+    :'<span class="form-hint">'+esc(latest.error||'未检查')+'</span>';
+  box.innerHTML=
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">'+
+    '<div class="form-group"><div class="form-label">当前版本</div><div style="font-weight:600">'+engineLabel(r.current)+'</div></div>'+
+    '<div class="form-group"><div class="form-label">最新版本</div><div style="font-weight:600">'+latestHtml+'</div></div>'+
+    '<div class="form-group"><div class="form-label">上一版本（可回退）</div><div style="font-weight:600">'+(r.previous?engineLabel(r.previous):'无')+'</div></div>'+
+    '</div>';
+  var rb=document.getElementById('btnRollbackLlama');
+  if(rb)rb.disabled=!r.previous;
+}
+
+var agentPollTimer=null;
+async function loadAgents(){
+  var box=document.getElementById('agentButtons');if(!box)return;
+  var r=await api('/api/agents');if(!r||!r.agents){box.textContent='无法读取 agent 列表';return}
+  var cwd=document.getElementById('agentCwd');
+  if(cwd&&!cwd.value){var saved='';try{saved=localStorage.getItem('agentCwd')||''}catch(e){}cwd.value=saved||r.default_cwd||''}
+  box.innerHTML=r.agents.map(function(a){
+    return a.installed
+      ?'<button class="btn '+(a.tag==='不推荐'?'btn-ghost':'btn-primary')+'" onclick="launchAgent('+esc(JSON.stringify(a.id))+')">▶️ '+esc(a.name)+(a.tag?'（'+esc(a.tag)+'）':'')+'</button>'
+      :'<button class="btn btn-ghost" title="'+esc(a.install)+'" onclick="copyText('+esc(JSON.stringify(a.install))+')">'+esc(a.name)+'（未安装，复制安装命令）</button>';
+  }).join('');
+  renderAgentState(r.state);
+}
+function renderAgentState(st){
+  var el=document.getElementById('agentState');if(!el||!st)return;
+  el.textContent=st.state==='idle'?'':(st.state==='starting'?'⏳ ':st.state==='opened'?'✅ ':'❌ ')+(st.message||'');
+  if(st.state==='starting'){
+    if(!agentPollTimer)agentPollTimer=setInterval(async function(){
+      var r=await api('/api/agents');if(r&&r.state)renderAgentState(r.state);
+    },2000);
+  }else if(agentPollTimer){clearInterval(agentPollTimer);agentPollTimer=null;pollStatus();}
+}
+async function launchAgent(id){
+  var cwd=(document.getElementById('agentCwd').value||'').trim();
+  try{localStorage.setItem('agentCwd',cwd)}catch(e){}
+  var vis=document.getElementById('agentVision');
+  var r=await api('/api/agents/launch','POST',{agent:id,cwd:cwd,vision:!!(vis&&vis.checked)});
+  if(!r||r.status==='error'){showToast((r&&r.message)||'启动失败',8000);return}
+  showToast(r.message,4000);
+  renderAgentState({state:'starting',message:r.message});
+}
+
+async function rollbackLlama(){
+  var st=await api('/api/status');
+  if(st&&st.server_running){showToast('请先停止服务器，再回退 llama.cpp', 6000);return}
+  if(!confirm('切换回上一版本的 llama.cpp？\n当前版本会保留，再点一次即可换回。'))return;
+  document.getElementById('btnRollbackLlama').disabled=true;
+  logLineCount=0;document.getElementById('deployLog').textContent='↩️ 开始回退 llama.cpp...\n';
+  var r=await api('/api/llama/rollback','POST');
+  if(r&&r.status==='error'){
+    showToast(r.message||'启动回退失败', 8000);
+    loadEngineInfo();
+    return;
+  }
+  startLogPoll();
+}
+
 async function upgradeLlama(){
   var st=await api('/api/status');
   if(st&&st.server_running){showToast('请先停止服务器，再升级 llama.cpp', 6000);return}
-  if(!confirm('升级 llama.cpp 到最新可用版本？\n失败时会自动回滚到当前版本。'))return;
+  if(!confirm('升级 llama.cpp 到最新版本？\n会自动匹配本机显卡与驱动；新引擎识别不到 GPU 等失败情况会自动回滚，\n成功后当前版本保留为“上一版本”，可随时一键回退。'))return;
   document.getElementById('btnUpgradeLlama').disabled=true;
   logLineCount=0;document.getElementById('deployLog').textContent='⬆️ 开始升级 llama.cpp...\n';
   var r=await api('/api/llama/update','POST');
@@ -3352,7 +3663,7 @@ function startLogPoll(){
     if(!data.running){clearInterval(logPollTimer);logPollTimer=null;
       document.getElementById('btnDeploy').disabled=false;
       var up=document.getElementById('btnUpgradeLlama');if(up)up.disabled=false;
-      pollStatus();}
+      pollStatus();loadEngineInfo();}
   },1000);
 }
 

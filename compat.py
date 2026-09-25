@@ -13,6 +13,7 @@ import platform
 import re
 import signal
 import subprocess
+import threading
 import sys
 import time
 import urllib.error
@@ -108,19 +109,88 @@ def estimate_tokens(text: str) -> int:
 
 
 def pid_running(pid: int) -> bool:
+    """网关进程是否存活：PID 存在且确实是 Python 进程。
+
+    PID 会被系统回收复用（重启后尤其常见）。只看 PID 是否存在时，过期的 PID 文件会让
+    start 误报"已在运行"，stop 更会 taskkill 掉无关进程（实测重启后 PID 落到了 conhost.exe）。
+    """
     try:
         if IS_WIN:
             r = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
-            return r.returncode == 0 and str(pid) in (r.stdout or "")
+            row = (r.stdout or "").strip().split('","')
+            name = row[0].strip('"').lower() if row and row[0] else ""
+            return r.returncode == 0 and str(pid) in (r.stdout or "") and "python" in name
         os.kill(pid, 0)
-        return True
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+                return "python" in f.read().lower()
+        except OSError:
+            return True
     except (ProcessLookupError, PermissionError):
         return isinstance(sys.exc_info()[1], PermissionError)
     except Exception:
         return False
+
+
+# ── 图片透传 ────────────────────────────────────────────────────────────────
+# 上游开了视觉（--mmproj）才能收图片，否则 llama-server 会拒绝整个请求。
+# 通过上游 /props 的 modalities.vision 判断，结果缓存一小段时间。
+_VISION_CACHE = {"ts": 0.0, "value": False, "url": ""}
+
+
+def upstream_vision(upstream_url: str) -> bool:
+    now = time.time()
+    if _VISION_CACHE["url"] == upstream_url and now - _VISION_CACHE["ts"] < 20:
+        return _VISION_CACHE["value"]
+    value = False
+    try:
+        with urllib.request.urlopen(upstream_url + "/props", timeout=3) as resp:
+            props = json.loads(resp.read().decode("utf-8"))
+        value = bool((props.get("modalities") or {}).get("vision"))
+    except Exception:
+        value = False
+    _VISION_CACHE.update({"ts": now, "value": value, "url": upstream_url})
+    return value
+
+
+# 当前请求是否透传图片；由 handler 在处理每个请求前按上游能力设置
+VISION = {"enabled": False}
+IMAGE_OMITTED = "[图片未发送：模型服务未开启视觉，请用「启动视觉服务」]"
+
+
+def image_url_of(block) -> str:
+    """把 Anthropic / OpenAI Chat / Responses / Gemini 四种图片格式统一成 URL（多为 data URI）。"""
+    if not isinstance(block, dict):
+        return ""
+    typ = block.get("type")
+    if typ == "image":                                   # Anthropic
+        src = block.get("source") or {}
+        if src.get("type") == "base64" and src.get("data"):
+            return f"data:{src.get('media_type', 'image/png')};base64,{src['data']}"
+        return src.get("url", "") if src.get("type") == "url" else ""
+    if typ == "image_url":                               # OpenAI Chat
+        value = block.get("image_url")
+        return value.get("url", "") if isinstance(value, dict) else str(value or "")
+    if typ == "input_image":                             # OpenAI Responses
+        value = block.get("image_url")
+        return value.get("url", "") if isinstance(value, dict) else str(value or "")
+    inline = block.get("inlineData")                     # Gemini
+    if isinstance(inline, dict) and inline.get("data"):
+        return f"data:{inline.get('mimeType', 'image/png')};base64,{inline['data']}"
+    return ""
+
+
+def with_images(text: str, urls: list):
+    """有图片且上游支持视觉时返回 OpenAI 多模态 content 列表，否则返回纯文本。"""
+    if not urls:
+        return text
+    if not VISION["enabled"]:
+        return "\n".join(x for x in (text, IMAGE_OMITTED) if x)
+    parts = [{"type": "text", "text": text}] if text else []
+    return parts + [{"type": "image_url", "image_url": {"url": u}} for u in urls]
 
 
 def content_to_text(content) -> str:
@@ -142,7 +212,7 @@ def content_to_text(content) -> str:
         if btype == "text":
             out.append(block.get("text", ""))
         elif btype == "image":
-            out.append("[image omitted by compatibility gateway]")
+            out.append(IMAGE_OMITTED)
         elif btype == "tool_result":
             result = content_to_text(block.get("content", ""))
             out.append(f"[tool_result {block.get('tool_use_id', '')}]\n{result}")
@@ -171,8 +241,8 @@ def openai_message_text(content) -> str:
                 typ = item.get("type")
                 if typ in ("input_text", "output_text", "text"):
                     parts.append(item.get("text", ""))
-                elif typ in ("input_image", "image_url"):
-                    parts.append("[image omitted by compatibility gateway]")
+                elif typ in ("input_image", "image_url", "image") or image_url_of(item):
+                    continue   # 图片由 normalize_openai_messages 通过 image_url_of 单独处理
                 else:
                     parts.append(json.dumps(item, ensure_ascii=False))
             else:
@@ -184,6 +254,7 @@ def openai_message_text(content) -> str:
 def normalize_openai_messages(messages: list) -> list:
     system_parts = []
     normalized = []
+    tool_images = []
     for msg in messages or []:
         if not isinstance(msg, dict):
             normalized.append({"role": "user", "content": str(msg)})
@@ -200,8 +271,21 @@ def normalize_openai_messages(messages: list) -> list:
 
         clean = dict(msg)
         clean["role"] = role if role in ("user", "assistant", "tool") else "user"
-        clean["content"] = openai_message_text(clean.get("content", ""))
+        raw = clean.get("content", "")
+        urls = [u for u in (image_url_of(b) for b in raw) if u] if isinstance(raw, list) else []
+        clean["content"] = openai_message_text(raw)
+        if clean["role"] != "tool" and tool_images:
+            normalized.append({"role": "user", "content": with_images("[上面工具返回的图片]", tool_images)})
+            tool_images = []
+        if urls and clean["role"] == "user":
+            clean["content"] = with_images(clean["content"], urls)
+        elif urls and clean["role"] == "tool":
+            # OpenAI 格式的 tool 消息只能是文本：工具读回的图片（如 agent 读取截图）等这一串
+            # 工具结果结束后放进一条 user 消息，模型才看得到，也不打断工具调用序列
+            tool_images.extend(urls)
         normalized.append(clean)
+    if tool_images:
+        normalized.append({"role": "user", "content": with_images("[上面工具返回的图片]", tool_images)})
 
     if system_parts:
         return [{"role": "system", "content": "\n\n".join(system_parts)}] + normalized
@@ -278,9 +362,25 @@ def responses_input_to_messages(payload: dict) -> list:
                         role = "user"
                     if role == "developer":
                         role = "system"
-                    messages.append({"role": role, "content": openai_message_text(item.get("content", ""))})
+                    # 原样交给 normalize_openai_messages，其中的图片才能保留下来
+                    messages.append({"role": role, "content": item.get("content", "")})
+                elif typ == "function_call":
+                    # 历史里的工具调用还原成 assistant 的 tool_calls（此前被当成 user 的 JSON 文本）
+                    call = {"id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                            "type": "function",
+                            "function": {"name": item.get("name", ""), "arguments": item.get("arguments") or "{}"}}
+                    if messages and messages[-1].get("role") == "assistant" and "tool_calls" in messages[-1]:
+                        messages[-1]["tool_calls"].append(call)
+                    elif messages and messages[-1].get("role") == "assistant":
+                        messages[-1]["tool_calls"] = [call]
+                    else:
+                        messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
                 elif typ == "function_call_output":
-                    messages.append({"role": "tool", "content": openai_message_text(item.get("output", ""))})
+                    output = item.get("output", "")
+                    messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
+                                     "content": output if isinstance(output, list) else openai_message_text(output)})
+                elif typ in ("reasoning",):
+                    continue
                 else:
                     messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
             else:
@@ -326,6 +426,52 @@ def tool_hint_text(tools: list) -> str:
     )
 
 
+def anthropic_blocks_to_openai(role: str, blocks: list) -> list:
+    """一条 Anthropic 消息 -> 若干 OpenAI 消息，保留真实的工具调用结构与图片。
+
+    此前 tool_use / tool_result 被压平成 "[tool_use ...]" 文本：模型看到的是一段
+    文字记录而不是工具调用历史，多步任务里容易开始"模仿文本"而不是真的调用工具。
+    """
+    texts, images, tool_calls, out = [], [], [], []
+    for block in blocks:
+        if not isinstance(block, dict):
+            texts.append(str(block))
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            texts.append(block.get("text", ""))
+        elif btype == "image":
+            url = image_url_of(block)
+            if url:
+                images.append(block)
+        elif btype == "tool_use" and role == "assistant":
+            tool_calls.append({"id": block.get("id") or f"toolu_{uuid.uuid4().hex[:12]}", "type": "function",
+                               "function": {"name": block.get("name", ""),
+                                            "arguments": json.dumps(block.get("input", {}), ensure_ascii=False)}})
+        elif btype == "tool_result":
+            result = block.get("content", "")
+            result_blocks = result if isinstance(result, list) else [{"type": "text", "text": str(result or "")}]
+            text = content_to_text([b for b in result_blocks if not (isinstance(b, dict) and b.get("type") == "image")])
+            if block.get("is_error"):
+                text = "[error] " + text
+            out.append({"role": "tool", "tool_call_id": block.get("tool_use_id", ""),
+                        "content": [{"type": "text", "text": text}]
+                        + [b for b in result_blocks if isinstance(b, dict) and b.get("type") == "image"]})
+        elif btype in ("thinking", "redacted_thinking"):
+            continue
+        else:
+            texts.append(content_to_text([block]))
+    text = "\n".join(t for t in texts if t)
+    if role == "assistant":
+        msg = {"role": "assistant", "content": text}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return out + [msg]
+    if text or images or not out:
+        out.append({"role": "user", "content": ([{"type": "text", "text": text}] if text else []) + images})
+    return out
+
+
 def anthropic_to_openai(payload: dict, cfg: dict) -> dict:
     cc = compat_config(cfg)
     messages = []
@@ -334,12 +480,16 @@ def anthropic_to_openai(payload: dict, cfg: dict) -> dict:
         messages.append({"role": "system", "content": system})
     if payload.get("tools") and cc.get("claude_tool_mode") != "text_only":
         messages.append({"role": "system", "content": tool_hint_text(payload.get("tools") or [])})
+    native_tools = cc.get("claude_tool_mode") != "text_only"
     for msg in payload.get("messages", []) or []:
         role = msg.get("role", "user")
         if role not in ("system", "user", "assistant"):
             role = "user"
-        text = content_to_text(msg.get("content", ""))
-        messages.append({"role": role, "content": text})
+        content = msg.get("content", "")
+        if not native_tools or not isinstance(content, list):
+            messages.append({"role": role, "content": content_to_text(content)})
+            continue
+        messages.extend(anthropic_blocks_to_openai(role, content))
 
     out = {
         "model": payload.get("model") or cc["model_alias"],
@@ -644,6 +794,21 @@ def gemini_part_text(part) -> str:
     return json.dumps(part, ensure_ascii=False)
 
 
+def gemini_schema_to_json(schema):
+    """Gemini 旧式 OpenAPI 子集（type 为大写 OBJECT/STRING）转成标准 JSON Schema。"""
+    if isinstance(schema, dict):
+        out = {}
+        for key, value in schema.items():
+            if key == "type" and isinstance(value, str):
+                out[key] = value.lower()
+            else:
+                out[key] = gemini_schema_to_json(value)
+        return out
+    if isinstance(schema, list):
+        return [gemini_schema_to_json(v) for v in schema]
+    return schema
+
+
 def gemini_to_openai(payload: dict, model: str) -> dict:
     messages = []
     sys_inst = payload.get("systemInstruction")
@@ -653,14 +818,42 @@ def gemini_to_openai(payload: dict, model: str) -> dict:
         if text:
             messages.append({"role": "system", "content": text})
 
+    # 历史里的 functionCall / functionResponse 转成真正的 tool_calls / tool 消息。
+    # 此前压平成 "[function_call ...]" 文本，模型会模仿着输出文本而不是真的调用工具。
+    pending = {}   # 工具名 -> 尚未收到结果的 call_id 队列（Gemini 按名称而非 id 配对）
+    call_seq = 0
     for content in payload.get("contents", []) or []:
         if not isinstance(content, dict):
             continue
-        role = content.get("role", "user")
-        role = "assistant" if role == "model" else "user"
-        parts = content.get("parts", []) or []
-        text = "\n".join(gemini_part_text(p) for p in parts)
-        messages.append({"role": role, "content": text})
+        role = "assistant" if content.get("role") == "model" else "user"
+        parts = [p for p in (content.get("parts", []) or [])]
+        calls = [p["functionCall"] for p in parts if isinstance(p, dict) and isinstance(p.get("functionCall"), dict)]
+        results = [p["functionResponse"] for p in parts if isinstance(p, dict) and isinstance(p.get("functionResponse"), dict)]
+        others = [p for p in parts if not (isinstance(p, dict) and ("functionCall" in p or "functionResponse" in p))]
+        images = [p for p in others if image_url_of(p)]
+        others = [p for p in others if not image_url_of(p)]
+        text = "\n".join(gemini_part_text(p) for p in others if gemini_part_text(p))
+        if images and role == "user":
+            # 交给 normalize_openai_messages：上游开了视觉就透传，没开就换成提示文字
+            messages.append({"role": "user", "content": ([{"type": "text", "text": text}] if text else []) + images})
+            text = ""
+        if role == "assistant" and calls:
+            tool_calls = []
+            for fc in calls:
+                call_seq += 1
+                call_id = fc.get("id") or f"call_{call_seq}"
+                pending.setdefault(fc.get("name", ""), []).append(call_id)
+                tool_calls.append({"id": call_id, "type": "function", "function": {
+                    "name": fc.get("name", ""), "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False)}})
+            messages.append({"role": "assistant", "content": text, "tool_calls": tool_calls})
+            continue
+        for fr in results:
+            queue = pending.get(fr.get("name", "")) or []
+            call_id = fr.get("id") or (queue.pop(0) if queue else f"call_{fr.get('name', '')}")
+            messages.append({"role": "tool", "tool_call_id": call_id,
+                             "content": json.dumps(fr.get("response", {}), ensure_ascii=False)})
+        if text or not results:
+            messages.append({"role": role, "content": text})
 
     gen = payload.get("generationConfig") or {}
     out = {
@@ -682,12 +875,16 @@ def gemini_to_openai(payload: dict, model: str) -> dict:
     for tool in payload.get("tools", []) or []:
         for fd in tool.get("functionDeclarations", []) or []:
             if isinstance(fd, dict) and fd.get("name"):
+                # 新版 Gemini CLI 用 parametersJsonSchema（标准 JSON Schema）声明参数，
+                # 旧格式 parameters 用大写类型名（OBJECT/STRING）。此前只读 parameters，
+                # 模型看不到参数定义只能乱猜，工具报 "must have required property 'file_path'"。
+                schema = fd.get("parametersJsonSchema") or gemini_schema_to_json(fd.get("parameters"))
                 tools.append({
                     "type": "function",
                     "function": {
                         "name": fd.get("name"),
                         "description": fd.get("description", ""),
-                        "parameters": fd.get("parameters") or {"type": "object", "properties": {}},
+                        "parameters": schema or {"type": "object", "properties": {}},
                     },
                 })
     if tools:
@@ -889,34 +1086,129 @@ class CompatHandler(BaseHTTPRequestHandler):
             except CLIENT_GONE_ERRORS:
                 return
 
-    def _stream_openai_response(self, response: dict):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self._cors()
-        self.end_headers()
+    def _proxy_sse(self, url: str, payload: dict, timeout: int):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            try:
+                self._send_json(json.loads(body), e.code)
+            except json.JSONDecodeError:
+                self._send_json({"error": {"message": body or str(e), "type": "upstream_error"}}, e.code)
+            return
+        except Exception as e:
+            self._send_json({"error": {"message": str(e), "type": "upstream_error"}}, 502)
+            return
+        with resp:
+            self.send_response(resp.getcode())
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream; charset=utf-8"))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self._cors()
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # 客户端断开：关闭上游连接，llama-server 随之停止生成
+                pass
+
+    def _stream_openai_response(self, response: dict, headers_sent: bool = False):
+        if not headers_sent:
+            self._sse_headers()
 
         def event(name: str, data: dict):
             self.wfile.write(f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        event("response.created", {"type": "response.created", "response": {k: v for k, v in response.items() if k != "output"}})
-        text = response.get("output_text", "")
-        if text:
-            event("response.output_text.delta", {"type": "response.output_text.delta", "item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": text})
-        event("response.completed", {"type": "response.completed", "response": response})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        # 按 Responses 协议完整回放：每个输出项都要先 output_item.added 再发增量，最后 done。
+        # 此前只发 output_text.delta，Codex 报 "OutputTextDelta without active item"，
+        # 工具调用则根本没有回放 —— 而 Codex 读写文件、执行命令全靠工具调用。
+        seq = iter(range(1, 1_000_000))
+        in_progress = {**{k: v for k, v in response.items() if k not in ("output", "output_text")},
+                       "status": "in_progress", "output": []}
+        event("response.created", {"type": "response.created", "sequence_number": 0, "response": in_progress})
+        event("response.in_progress", {"type": "response.in_progress", "sequence_number": next(seq), "response": in_progress})
+        for index, item in enumerate(response.get("output") or []):
+            if item.get("type") == "message":
+                started = {**item, "status": "in_progress", "content": []}
+                event("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next(seq),
+                                                     "output_index": index, "item": started})
+                for c_index, part in enumerate(item.get("content") or []):
+                    text = part.get("text", "")
+                    event("response.content_part.added", {"type": "response.content_part.added", "sequence_number": next(seq),
+                                                          "item_id": item["id"], "output_index": index, "content_index": c_index,
+                                                          "part": {**part, "text": ""}})
+                    if text:
+                        event("response.output_text.delta", {"type": "response.output_text.delta", "sequence_number": next(seq),
+                                                             "item_id": item["id"], "output_index": index,
+                                                             "content_index": c_index, "delta": text})
+                    event("response.output_text.done", {"type": "response.output_text.done", "sequence_number": next(seq),
+                                                        "item_id": item["id"], "output_index": index,
+                                                        "content_index": c_index, "text": text})
+                    event("response.content_part.done", {"type": "response.content_part.done", "sequence_number": next(seq),
+                                                         "item_id": item["id"], "output_index": index,
+                                                         "content_index": c_index, "part": part})
+            elif item.get("type") == "function_call":
+                event("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next(seq),
+                                                     "output_index": index,
+                                                     "item": {**item, "status": "in_progress", "arguments": ""}})
+                event("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta",
+                                                                 "sequence_number": next(seq), "item_id": item["id"],
+                                                                 "output_index": index, "delta": item.get("arguments", "")})
+                event("response.function_call_arguments.done", {"type": "response.function_call_arguments.done",
+                                                                "sequence_number": next(seq), "item_id": item["id"],
+                                                                "output_index": index, "arguments": item.get("arguments", "")})
+            event("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next(seq),
+                                                "output_index": index, "item": item})
+        event("response.completed", {"type": "response.completed", "sequence_number": next(seq), "response": response})
 
-    def _send_anthropic_stream(self, message: dict):
+    def _sse_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self._cors()
         self.end_headers()
+        self.wfile.flush()
 
+    def _wait_with_heartbeat(self, fn, beat: bytes, interval: float = 5.0):
+        """后台线程执行 fn（等上游完整生成），期间每隔 interval 秒给客户端发一次心跳。
+
+        上游是非流式调用：长回复（如 agent 一次写出整个脚本）要生成 2-3 分钟，
+        其间一个字节都不发，客户端会判定连接空闲、断开并原样重试 —— 实测 Claude Code
+        因此把同一个请求重发了几十次，最终 "Request timed out"。
+        """
+        result = {}
+
+        def run():
+            try:
+                result["value"] = fn()
+            except Exception as e:  # 交给调用方
+                result["error"] = e
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(interval)
+            if worker.is_alive():
+                self.wfile.write(beat)
+                self.wfile.flush()
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    def _send_anthropic_stream(self, message: dict, started: bool = False):
         def event(name: str, data: dict):
             raw = f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
             self.wfile.write(raw)
@@ -925,7 +1217,9 @@ class CompatHandler(BaseHTTPRequestHandler):
         msg = dict(message)
         content = msg.pop("content", [])
         msg["content"] = []
-        event("message_start", {"type": "message_start", "message": msg})
+        if not started:
+            self._sse_headers()
+            event("message_start", {"type": "message_start", "message": msg})
         for idx, block in enumerate(content):
             if block.get("type") == "text":
                 event("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
@@ -1020,6 +1314,8 @@ class CompatHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         data = self._read_json()
         model = self._model_id(cfg)
+        # 上游开了视觉才透传图片，否则 llama-server 会拒绝整个请求
+        VISION["enabled"] = upstream_vision(cc["upstream_url"])
 
         if path == "/v1/messages/count_tokens":
             text = anthropic_system_to_text(data.get("system"))
@@ -1031,15 +1327,38 @@ class CompatHandler(BaseHTTPRequestHandler):
         if path == "/v1/messages":
             openai_payload = anthropic_to_openai(data, cfg)
             tool_schemas = tool_schemas_from_payload(data)
+            if data.get("stream"):
+                # 先发 message_start，等待上游期间发 Anthropic 协议自带的 ping 事件保活
+                self._sse_headers()
+                start = {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
+                         "model": data.get("model") or model, "content": [], "stop_reason": None,
+                         "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}
+                ping = b'event: ping\ndata: {"type": "ping"}\n\n'
+                try:
+                    self.wfile.write(("event: message_start\ndata: " + json.dumps(
+                        {"type": "message_start", "message": start}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                    status, upstream = self._wait_with_heartbeat(
+                        lambda: self._call_openai_chat(openai_payload, cfg), ping)
+                    if status >= 400:
+                        err = upstream.get("error") if isinstance(upstream, dict) else upstream
+                        err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                        self.wfile.write(("event: error\ndata: " + json.dumps(
+                            {"type": "error", "error": {"type": "api_error", "message": err_msg}},
+                            ensure_ascii=False) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                        return
+                    message = openai_to_anthropic(upstream, cfg, data.get("model") or model, tool_schemas)
+                    self._send_anthropic_stream(message, started=True)
+                except CLIENT_GONE_ERRORS:
+                    pass
+                return
             status, upstream = self._call_openai_chat(openai_payload, cfg)
             if status >= 400:
                 self._send_json(upstream, status)
                 return
             message = openai_to_anthropic(upstream, cfg, data.get("model") or model, tool_schemas)
-            if data.get("stream"):
-                self._send_anthropic_stream(message)
-            else:
-                self._send_json(message)
+            self._send_json(message)
             return
 
         if path == "/api/chat":
@@ -1139,6 +1458,22 @@ class CompatHandler(BaseHTTPRequestHandler):
                 self._send_json({"totalTokens": estimate_tokens(text)})
                 return
             openai_payload = gemini_to_openai(data, gemini_model or model)
+            if method == "streamGenerateContent" and openai_payload.get("tools"):
+                # 带工具的请求：流式路径只转发文本增量，工具调用会丢失，Gemini CLI 报
+                # "empty response or malformed tool call"。改为完整取回后作为一个 SSE 事件发出。
+                self._sse_headers()
+                try:
+                    status, upstream = self._wait_with_heartbeat(
+                        lambda: self._call_openai_chat(openai_payload, cfg), b": keepalive\n\n")
+                    payload = (openai_to_gemini(upstream) if status < 400 else
+                               {"error": {"message": str(upstream.get("error", upstream)
+                                                         if isinstance(upstream, dict) else upstream),
+                                          "status": "UNAVAILABLE"}})
+                    self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                except CLIENT_GONE_ERRORS:
+                    pass
+                return
             if method == "streamGenerateContent":
                 self._stream_gemini(openai_payload, cfg)
                 return
@@ -1155,8 +1490,10 @@ class CompatHandler(BaseHTTPRequestHandler):
                 "model": data.get("model") or model,
                 "messages": messages,
                 "stream": False,
-                "max_tokens": int(data.get("max_output_tokens") or data.get("max_tokens") or 1024),
             }
+            # 客户端没给上限就不设：原先默认 1024，Codex 一次写整个文件会被截断
+            if data.get("max_output_tokens") or data.get("max_tokens"):
+                openai_payload["max_tokens"] = int(data.get("max_output_tokens") or data.get("max_tokens"))
             if data.get("temperature") is not None:
                 openai_payload["temperature"] = data.get("temperature")
             openai_payload = apply_template_thinking(
@@ -1168,15 +1505,44 @@ class CompatHandler(BaseHTTPRequestHandler):
                 openai_payload["tools"] = tools
                 openai_payload["parallel_tool_calls"] = False
                 openai_payload["tool_choice"] = "auto"
-            status, upstream = self._call_openai_chat(openai_payload, cfg)
-            if status >= 400:
-                self._send_json(upstream, status)
-                return
+            streaming = bool(data.get("stream"))
+            if streaming:
+                # 先发响应头，等待上游完整生成期间用 SSE 注释行保活（客户端会忽略注释）
+                self._sse_headers()
+                try:
+                    status, upstream = self._wait_with_heartbeat(
+                        lambda: self._call_openai_chat(openai_payload, cfg), b": keepalive\n\n")
+                except CLIENT_GONE_ERRORS:
+                    return
+                if status >= 400:
+                    err = upstream.get("error") if isinstance(upstream, dict) else upstream
+                    err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                    try:
+                        self.wfile.write(("event: error\ndata: " + json.dumps(
+                            {"type": "error", "message": err_msg}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                    except CLIENT_GONE_ERRORS:
+                        pass
+                    return
+            else:
+                status, upstream = self._call_openai_chat(openai_payload, cfg)
+                if status >= 400:
+                    self._send_json(upstream, status)
+                    return
             choice = (upstream.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
             text = msg.get("content") or ""
             resp_id = f"resp_{uuid.uuid4().hex}"
             output_items = []
+            # 模型先说话、再调用工具：文本项放在工具调用前面，符合 Responses 的输出顺序
+            if text:
+                output_items.append({
+                    "id": f"msg_{uuid.uuid4().hex[:16]}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                })
             for call in msg.get("tool_calls") or []:
                 fn = call.get("function") or {}
                 output_items.append({
@@ -1187,7 +1553,7 @@ class CompatHandler(BaseHTTPRequestHandler):
                     "call_id": call.get("id") or f"call_{uuid.uuid4().hex[:16]}",
                     "arguments": fn.get("arguments") or "{}",
                 })
-            if text or not output_items:
+            if not output_items:
                 output_items.append({
                     "id": f"msg_{uuid.uuid4().hex[:16]}",
                     "type": "message",
@@ -1211,8 +1577,11 @@ class CompatHandler(BaseHTTPRequestHandler):
                     "total_tokens": int(usage.get("total_tokens", 0) or 0),
                 },
             }
-            if data.get("stream"):
-                self._stream_openai_response(response)
+            if streaming:
+                try:
+                    self._stream_openai_response(response, headers_sent=True)
+                except CLIENT_GONE_ERRORS:
+                    pass
             else:
                 self._send_json(response)
             return
@@ -1225,6 +1594,11 @@ class CompatHandler(BaseHTTPRequestHandler):
                     upstream_payload,
                     request_thinking_enabled(thinking_value, False),
                 )
+            if upstream_payload.get("stream"):
+                # 流式请求原样透传 SSE。此前一律按 JSON 解析上游响应，
+                # Qwen Code / OpenCode 等流式客户端全部收到 502 "Expecting value"。
+                self._proxy_sse(cc["upstream_url"] + path, upstream_payload, cc["request_timeout"])
+                return
             status, upstream = http_json("POST", cc["upstream_url"] + path, upstream_payload, cc["request_timeout"])
             self._send_json(upstream, status)
             return
@@ -1301,6 +1675,11 @@ def cmd_stop() -> int:
         print("invalid PID file removed")
         return 0
     pid = int(text)
+    if not pid_running(pid):
+        # PID 已不是网关（进程已退出且 PID 被复用）：只清理 PID 文件，绝不 kill
+        PID_FILE.unlink(missing_ok=True)
+        print(f"stale PID file removed (PID {pid} is not the gateway)")
+        return 0
     try:
         if IS_WIN:
             subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, text=True)

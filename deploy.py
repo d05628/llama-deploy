@@ -56,6 +56,10 @@ from typing import Optional
 VERSION = "1.0.1"
 BASE_DIR = Path(__file__).parent.resolve()
 LLAMA_DIR = BASE_DIR / "llama.cpp"
+# 升级成功后保留的上一版引擎；--rollback-llama 在两者之间互换
+LLAMA_PREVIOUS_DIR = BASE_DIR / "llama.cpp.previous"
+# 记录安装的是哪个 release 包（tag / CUDA 变体），供管理器展示
+ENGINE_INFO_NAME = ".llama-deploy.json"
 MODELS_DIR = BASE_DIR / "models"
 VENV_DIR = BASE_DIR / ".hf-venv"
 CONFIG_FILE = BASE_DIR / "config.jsonc"
@@ -287,6 +291,69 @@ class SystemInfo:
         except Exception:
             pass
         return -1
+
+
+def write_engine_info(info: dict, engine_dir: Path = None):
+    try:
+        ((engine_dir or LLAMA_DIR) / ENGINE_INFO_NAME).write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def engine_version(engine_dir: Path) -> str:
+    """运行 engine_dir 里的 llama-server --version，返回 "b11160" 这样的版本号。"""
+    exe = "llama-server.exe" if platform.system() == "Windows" else "llama-server"
+    for candidate in (engine_dir / exe, engine_dir / "build" / "bin" / exe, engine_dir / "bin" / exe):
+        if candidate.exists():
+            try:
+                result = subprocess.run(
+                    [str(candidate), "--version"], capture_output=True, text=True, timeout=30,
+                    cwd=str(candidate.parent), encoding="utf-8", errors="replace",
+                )
+            except Exception:
+                return ""
+            build = Deployer._parse_llama_build((result.stdout or "") + (result.stderr or ""))
+            return f"b{build}" if result.returncode == 0 and build else ""
+    return ""
+
+
+def rollback_llama() -> int:
+    """在当前引擎与 llama.cpp.previous 之间互换。再执行一次即可换回新版。"""
+    if not LLAMA_PREVIOUS_DIR.exists():
+        print("❌ 没有可回退的上一版本（llama.cpp.previous 不存在）")
+        return 1
+    running = running_llama_processes()
+    if running:
+        print("❌ 请先停止所有 llama.cpp 进程再回退: " + ", ".join(running))
+        return 1
+    before = engine_version(LLAMA_DIR) if LLAMA_DIR.exists() else ""
+    swap = BASE_DIR / f"llama.cpp.swap-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        if LLAMA_DIR.exists():
+            os.replace(LLAMA_DIR, swap)
+        try:
+            os.replace(LLAMA_PREVIOUS_DIR, LLAMA_DIR)
+        except OSError:
+            if swap.exists():
+                os.replace(swap, LLAMA_DIR)
+            raise
+        if swap.exists():
+            os.replace(swap, LLAMA_PREVIOUS_DIR)
+    except OSError as e:
+        print(f"❌ 回退失败，当前引擎未改动: {e}")
+        return 1
+    after = engine_version(LLAMA_DIR)
+    if not after:
+        # 上一版本跑不起来：换回去，不留下坏状态
+        os.replace(LLAMA_DIR, swap)
+        os.replace(LLAMA_PREVIOUS_DIR, LLAMA_DIR)
+        os.replace(swap, LLAMA_PREVIOUS_DIR)
+        print("❌ 上一版本无法运行，已恢复原引擎")
+        return 1
+    print(f"✅ 已回退: {before or '未知版本'} -> {after}")
+    print(f"   原引擎保留在 {LLAMA_PREVIOUS_DIR.name}，再执行一次 --rollback-llama 即可换回")
+    return 0
 
 
 def running_llama_processes() -> list:
@@ -790,7 +857,7 @@ class Deployer:
             raise
         else:
             if self.llama_backup_dir:
-                self._cleanup_llama_backup(self.llama_backup_dir)
+                self._keep_previous_engine(self.llama_backup_dir)
 
         if not self.upgrade_llama:
             self._step(4, total_steps, "download_model", self._download_model)
@@ -1021,6 +1088,14 @@ class Deployer:
                 raise RuntimeError("CUDA 运行时下载失败，已取消升级")
             self._extract_zip_flat(cudart_zip, LLAMA_DIR)
             cudart_zip.unlink(missing_ok=True)
+
+        write_engine_info({
+            "tag": self.target_llama_tag,
+            "asset": main_asset.get("name", ""),
+            "runtime": (cudart_asset or {}).get("name", ""),
+            "backend": getattr(self, "actual_backend", ""),
+            "installed_at": datetime.now().isoformat(timespec="seconds"),
+        })
 
         # 重新定位 bin 路径（解压后路径才确定）
         self._relocate_bins()
@@ -1263,8 +1338,12 @@ class Deployer:
             supported_text = str(self.gpu_info.get("cuda_version", "") or "")
             supported_match = re.match(r"(\d+)(?:\.(\d+))?", supported_text)
             if supported_match:
-                supported = (int(supported_match.group(1)), int(supported_match.group(2) or 0))
-                paired = [item for item in paired if item[0] <= supported]
+                # CUDA 11.1 起支持"次版本兼容"：同一主版本内，驱动只要满足该主版本的
+                # 最低要求就能运行任意次版本的包（13.x 需驱动 ≥ 580）。只比主版本。
+                # 实测：驱动 581.80 报告 CUDA 13.0，照样正常运行 cuda-13.4 包；
+                # 此前按次版本过滤会退回 cuda-12.4，丢掉 RTX 50 的 sm_120 原生内核。
+                supported_major = int(supported_match.group(1))
+                paired = [item for item in paired if item[0][0] <= supported_major]
             elif any(item[0][0] == 12 for item in paired):
                 # 无法检测驱动上限时，优先兼容面更广的 CUDA 12。
                 paired = [item for item in paired if item[0][0] == 12]
@@ -1351,6 +1430,24 @@ class Deployer:
             except OSError:
                 print(f"   ⚠️  失败版本已隔离但无法清理: {failed_dir}")
 
+    def _keep_previous_engine(self, backup_dir: Path):
+        """升级成功后把旧引擎保留为 llama.cpp.previous，而不是删掉。
+
+        新版通过了启动与 GPU 检测，不代表实际更快、更稳；保留上一版，
+        用户随时可以 python deploy.py --rollback-llama 一键换回。只保留一份。
+        """
+        if not backup_dir or not backup_dir.exists():
+            return
+        try:
+            if LLAMA_PREVIOUS_DIR.exists():
+                shutil.rmtree(LLAMA_PREVIOUS_DIR)
+            os.replace(backup_dir, LLAMA_PREVIOUS_DIR)
+            self.llama_backup_dir = None
+            print(f"   ↩️  上一版本已保留为 {LLAMA_PREVIOUS_DIR.name}，"
+                  "如需换回：python deploy.py --rollback-llama")
+        except OSError as e:
+            print(f"   ⚠️  无法保留上一版本（{e}），旧备份仍在 {backup_dir}")
+
     def _cleanup_llama_backup(self, backup_dir: Path):
         if backup_dir and backup_dir.exists():
             try:
@@ -1396,6 +1493,8 @@ class Deployer:
                 raise RuntimeError(f"无法解析 {name} 版本: {output[-300:]}")
             versions[name] = build
 
+        self._verify_gpu_devices()
+
         target = int(re.sub(r"\D", "", self.target_llama_tag) or "0")
         for name, got in versions.items():
             if target and got < target:
@@ -1404,6 +1503,38 @@ class Deployer:
             print(f"   ✅ llama.cpp 当前版本: b{versions['llama-server']}")
         else:
             print("   ✅ llama.cpp 二进制运行验证通过（源码构建未提供 build number）")
+
+    def _verify_gpu_devices(self):
+        """新引擎必须真的能用上 GPU：--version 能跑不代表 CUDA/Vulkan 后端能加载。
+
+        驱动太旧、运行时 DLL 缺失时，llama.cpp 会静默退回 CPU，
+        速度差一个数量级却不报错 —— 这里把它当成升级失败，交给外层回滚。
+        """
+        backend = getattr(self, "actual_backend", "cpu")
+        if backend not in ("cuda", "vulkan"):
+            return
+        try:
+            result = subprocess.run(
+                [str(self.server_bin), "--list-devices"],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(self.server_bin.parent), encoding="utf-8", errors="replace",
+            )
+        except Exception as e:
+            raise RuntimeError(f"llama-server --list-devices 无法运行: {e}") from e
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if "--list-devices" in output and "invalid argument" in output:
+            print("   ⚠️  当前版本不支持 --list-devices，跳过 GPU 检测")
+            return
+        wanted = "CUDA" if backend == "cuda" else "Vulkan"
+        devices = [line.strip() for line in output.splitlines()
+                   if re.match(rf"\s*{wanted}\d+:", line)]
+        if not devices:
+            raise RuntimeError(
+                f"新引擎没有检测到 {wanted} 设备（会退回 CPU 运行），视为升级失败: "
+                + output.strip()[-300:]
+            )
+        for device in devices:
+            print(f"   ✅ GPU 可用: {device}")
 
     @staticmethod
     def _parse_llama_build(output: str) -> int:
@@ -2097,6 +2228,8 @@ class Deployer:
 
 if __name__ == "__main__":
     try:
+        if "--rollback-llama" in sys.argv:
+            sys.exit(rollback_llama())
         force_source = "--build-from-source" in sys.argv
         upgrade_llama = force_source or "--upgrade-llama" in sys.argv or "--update-llama" in sys.argv
         deployer = Deployer(upgrade_llama=upgrade_llama, force_source=force_source)

@@ -34,6 +34,7 @@ IS_WIN = platform.system() == "Windows"
 HELP_CACHE = {}
 META_CACHE = {}
 TENSOR_CACHE = {}
+TENSOR_SIZE_CACHE = {}
 PHYSICAL_CPU_CACHE = None
 FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
@@ -330,6 +331,61 @@ def gguf_tensor_names(model_path: Path) -> list:
         names = []
     TENSOR_CACHE[key] = names
     return names
+
+
+def gguf_tensor_sizes(model_path: Path) -> dict:
+    """返回 {张量名: 字节数}。张量数据按 offset 顺序紧密排列（中间只有对齐填充），
+    相邻 offset 之差就是张量体积，最后一个张量取到文件末尾。分片模型返回空字典。"""
+    key = str(model_path.resolve()) if model_path and model_path.exists() else str(model_path)
+    if key in TENSOR_SIZE_CACHE:
+        return TENSOR_SIZE_CACHE[key]
+    sizes = {}
+    try:
+        if len(model_files(model_path)) == 1:
+            with open(model_path, "rb") as f:
+                if _rx(f, 4) == b"GGUF" and _u32(f) >= 2:
+                    n_tensors, n_kv = _u64(f), _u64(f)
+                    alignment = 32
+                    for _ in range(n_kv):
+                        k, t = _s(f), _u32(f)
+                        if k == "general.alignment" and t in (4, 5, 10, 11):
+                            alignment = int(_scalar(f, t)) or 32
+                        else:
+                            _skip(f, t)
+                    infos = []
+                    for _ in range(n_tensors):
+                        name = _s(f)
+                        f.seek(8 * _u32(f) + 4, 1)  # dims + type
+                        infos.append((_u64(f), name))
+                    data_start = -(-f.tell() // alignment) * alignment
+                    end = model_path.stat().st_size - data_start
+                    infos.sort()
+                    for i, (offset, name) in enumerate(infos):
+                        sizes[name] = (infos[i + 1][0] if i + 1 < len(infos) else end) - offset
+    except Exception:
+        sizes = {}
+    TENSOR_SIZE_CACHE[key] = sizes
+    return sizes
+
+
+def gpu_weight_mb(model_path: Path, meta: dict, mtp_enabled: bool = False) -> float:
+    """估算全部层卸载时真正进显存的权重体积（MiB）。
+
+    文件体积会高估：llama.cpp 始终把 token_embd 留在 CPU（每 token 只查一行表），
+    MTP 层在不开推测解码时根本不加载。Qwen3.8-27B NVFP4 文件 16332MiB，
+    实际进显存 15098MiB —— 与 llama.cpp --fit 的 model 列一致；
+    按文件体积算会把"差一点装下"误判成"差很多"。
+    """
+    sizes = gguf_tensor_sizes(model_path)
+    if not sizes:
+        return model_size_mb(model_path)
+    skipped = sizes.get("token_embd.weight", 0)
+    n_mtp = _safe_int(meta.get("nextn_predict_layers"), 0)
+    if n_mtp and not mtp_enabled:
+        first_mtp = _safe_int(meta.get("block_count"), 0) - n_mtp
+        mtp_prefixes = tuple(f"blk.{i}." for i in range(first_mtp, first_mtp + n_mtp))
+        skipped += sum(v for k, v in sizes.items() if k.startswith(mtp_prefixes))
+    return (sum(sizes.values()) - skipped) / (1024 * 1024)
 
 
 def has_mtp_head(model_path: Path) -> bool:
@@ -767,12 +823,37 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
     # ── 显存预算体检 ────────────────────────────────────────────────────────
     # 权重装不下时 llama.cpp 会把层甩到 CPU，吐字速度会掉到原来的几分之一，
     # 但过程里没有任何提示。这里按元数据把账算清楚，直接告诉用户瓶颈在哪。
-    kv_mb = kv_cache_mb(meta, ctx_size, cache_value("cache_type_k"), cache_value("cache_type_v"))
+    # 实测 Qwen3.8-27B NVFP4：66 层全在 GPU 与只放 60 层，吐字差 3 倍以上；
+    # 按真正进显存的权重算，而不是文件体积（见 gpu_weight_mb）。
+    weights_mb = gpu_weight_mb(model_path, meta) if cuda else size_mb
+    mtp_extra_mb = (gpu_weight_mb(model_path, meta, mtp_enabled=True) - weights_mb) if cuda else 0.0
+    auto_ctx = ctx_size <= 0
+    min_ctx = _safe_int_min(pc.get("min_ctx_size", 8192), 8192, 512)
+    # 自动上下文时按下限估算：--fit 会先缩小上下文，缩到下限仍装不下才卸载层
+    budget_ctx = min_ctx if auto_ctx else ctx_size
+    kv_mb = kv_cache_mb(meta, budget_ctx, cache_value("cache_type_k"), cache_value("cache_type_v"))
+    gpu_fits = gpu_fits_mtp = True
+    if cuda and free_mb > 0:
+        # 视觉模块放 CPU（mmproj_offload=false）时不占显存
+        base_overhead = 600.0 + (mmproj_mb if (vision and mmproj_mb > 0 and mmproj_offload) else 0.0)
+        usable = free_mb - fit_target
+        gpu_fits = weights_mb + base_overhead + kv_mb <= usable
+        # 混合架构每个草稿 token 都要一份循环状态拷贝：实测 27B draft-n-max=3 时
+        # RS 缓冲从 134 涨到 598MiB，另有草稿 KV 与两份计算缓冲约 170MiB
+        draft_n = _safe_int_min(pc.get("spec_draft_n_max", 2), 2, 1)
+        mtp_runtime_mb = 170.0 + 155.0 * draft_n
+        gpu_fits_mtp = weights_mb + mtp_extra_mb + mtp_runtime_mb + base_overhead + kv_mb <= usable
+        if auto_ctx and gpu_fits:
+            # 不在这里预估具体数值：WDDM 下 nvidia-smi 报的空闲与 CUDA 实际可分配的
+            # 能差数百 MiB，MTP 又会再吃掉一截。最终值以 llama-server 日志的 n_ctx 为准。
+            notes.append(f"上下文自动适配显存：在权重全部驻留 GPU 的前提下取最大值（下限 {min_ctx}），"
+                         "实际值见日志中的 n_ctx")
+    file_size_mb, size_mb = size_mb, weights_mb
     if cuda and free_mb > 0 and kv_mb > 0:
         # 计算缓冲 + 循环状态 + CUDA context 的经验值。视觉模式还要算上常驻显存的
         # mmproj 权重，且 fit_target 会被抬到 mmproj 的量级，两项一起吃掉的显存
         # 足以把本来装得下的模型重新挤回 CPU —— 这正是开视觉后吐字变慢的原因。
-        vision_mb = mmproj_mb if (vision and mmproj_mb > 0) else 0.0
+        vision_mb = mmproj_mb if (vision and mmproj_mb > 0 and mmproj_offload) else 0.0
         overhead_mb = 600.0 + vision_mb
         # llama.cpp 按 fit_target 保留一块显存不用，这部分不能算进权重预算
         usable_mb = max(0.0, free_mb - fit_target)
@@ -782,8 +863,10 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
         )
         if size_mb + overhead_mb >= usable_mb:
             budget_gb = max(0.0, usable_mb - overhead_mb - kv_mb) / 1024
-            head = (f"权重 {size_mb / 1024:.1f}GB 超出可用显存 {usable_mb / 1024:.1f}GB，"
-                    f"必然有一部分层留在 CPU 上，这是吐字慢的主因；")
+            shortfall = size_mb + overhead_mb + kv_mb - usable_mb
+            head = (f"需进显存的权重 {size_mb / 1024:.1f}GB 加运行开销超出可用显存 {usable_mb / 1024:.1f}GB"
+                    f"（差约 {shortfall:.0f}MiB），必然有一部分层留在 CPU 上，"
+                    f"实测吐字会降到满速的 1/3 左右；")
             if vision_mb:
                 # 视觉模式下先看看关掉视觉是否就能装下——这是最省事的解法
                 text_usable = free_mb - text_mode_fit_target
@@ -805,22 +888,26 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
                 )
             else:
                 # 已经在用 4bit KV 时就别再建议换 KV 类型了
-                lever = ("调小 ctx_size"
+                ctx_key = "min_ctx_size" if auto_ctx else "ctx_size"
+                lever = (f"调小 {ctx_key}"
                          if _CACHE_TYPE_BYTES.get(cache_value("cache_type_k"), 2.0) <= 0.65
-                         else "调小 ctx_size 或改用 q4_0 KV")
+                         else f"调小 {ctx_key} 或改用 q4_0 KV")
+                ctx_desc = f"最小上下文 {budget_ctx}" if auto_ctx else f"ctx_size={ctx_size}"
                 notes.append(
-                    head + f"当前 ctx_size={ctx_size} 还要额外占用 {kv_mb:.0f}MiB KV cache，"
-                           f"{lever} 能把这部分显存让给权重。"
-                           f"若要让权重完整驻留显存，需换用体积 ≤{budget_gb:.1f}GB 的量化档位"
+                    head + f"{ctx_desc} 还要额外占用 {kv_mb:.0f}MiB KV cache，"
+                           f"{lever} 只能多保住几层。"
+                           f"要满速运行，需换用显存内权重 ≤{budget_gb:.1f}GB 的量化档位"
+                           f"（该模型为 {size_mb / 1024:.1f}GB）"
                 )
         else:
             max_ctx = max_ctx_for_vram(meta, size_mb, usable_mb,
                                        cache_value("cache_type_k"), cache_value("cache_type_v"),
                                        overhead_mb)
-            if 0 < max_ctx < ctx_size:
+            if not auto_ctx and 0 < max_ctx < ctx_size:
                 notes.append(
                     f"ctx_size={ctx_size} 需要 {kv_mb:.0f}MiB KV cache，加上权重会超出可用显存，"
-                    f"部分层会被挤到 CPU 上；当前显存下建议 ctx_size ≤{max_ctx}"
+                    f"部分层会被挤到 CPU 上、吐字降到满速的 1/3 左右；当前显存下建议 ctx_size ≤{max_ctx} —— "
+                    f"或设为 0，启动时自动取显存允许的最大值"
                     + vision_note
                 )
 
@@ -829,12 +916,16 @@ def performance_tuning(model_path: Path, meta: dict, gpu: dict, pc: dict,
 
     return {
         "profile": profile,
-        "model_size_mb": size_mb,
+        "model_size_mb": file_size_mb,
         "pressure": pressure,
         "cache_type_k": cache_value("cache_type_k"),
         "cache_type_v": cache_value("cache_type_v"),
         "fit_target_mb": fit_target,
         "mmproj_offload": mmproj_offload,
+        "gpu_weight_mb": weights_mb,
+        "gpu_fits": gpu_fits,
+        "gpu_fits_mtp": gpu_fits_mtp,
+        "min_ctx": min_ctx,
         "notes": notes,
     }
 
@@ -950,6 +1041,81 @@ def pid_running(pid: int, expect: str = "") -> bool:
         except Exception:
             return False
     return expect.lower() in name.lower() if expect else True
+
+
+def gpu_memory_consumers(min_mb: int = 50) -> list:
+    """Windows：列出占用独占显存的进程 [(名称, MiB)]，按占用降序。只读，不关闭任何程序。
+
+    WDDM 下 nvidia-smi 看不到每个进程的显存，只能读性能计数器。
+    浏览器、VS Code、NVIDIA Overlay 这类硬件加速程序关掉（或改用软件渲染）
+    就能把显存还给模型；dwm / csrss 属于系统桌面，无法释放。
+    """
+    if not IS_WIN:
+        return []
+    script = (
+        r"(Get-Counter '\GPU Process Memory(*)\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples"
+        r" | ForEach-Object { if ($_.InstanceName -match 'pid_(\d+)') { '{0} {1}' -f $Matches[1], [math]::Round($_.CookedValue/1MB) } }"
+    )
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return []
+    per_pid = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            per_pid[int(parts[0])] = per_pid.get(int(parts[0]), 0) + int(parts[1])
+    per_name = {}
+    for pid, mb in per_pid.items():
+        name = process_name(pid) or f"PID {pid}"
+        per_name[name] = per_name.get(name, 0) + mb
+    return sorted(((n, mb) for n, mb in per_name.items() if mb >= min_mb), key=lambda x: -x[1])
+
+
+# 系统桌面进程：显存无法释放，只列出、不建议关闭
+_SYSTEM_GPU_PROCESSES = {"dwm.exe", "csrss.exe", "explorer.exe", "system"}
+
+
+def vram_hog_note(meta: dict, cache_type: str) -> str:
+    """把可释放的显存大户折算成上下文长度，拼成一条可执行的提示；没有则返回空字符串。"""
+    hogs = [(n, mb) for n, mb in gpu_memory_consumers()
+            if n.lower() not in _SYSTEM_GPU_PROCESSES and "llama" not in n.lower()]
+    if not hogs:
+        return ""
+    total = sum(mb for _, mb in hogs)
+    per_token_mb = kv_cache_mb(meta, 1024, cache_type, cache_type) / 1024
+    gain = f"，约可多出 {int(total / per_token_mb) // 1024}K 上下文" if per_token_mb > 0 else ""
+    listing = "、".join(f"{n[:-4] if n.lower().endswith('.exe') else n} {mb}MiB" for n, mb in hogs[:5])
+    return (f"以下程序占用显存 {total}MiB（{listing}）；关闭它们或在其设置中关闭硬件加速"
+            f"（改用内存/CPU 渲染）后重启模型服务{gain}")
+
+
+def running_llama_servers() -> list:
+    """返回所有存活的 llama-server 进程 PID。"""
+    try:
+        if IS_WIN:
+            r = rc(["tasklist", "/FI", "IMAGENAME eq llama-server.exe", "/NH", "/FO", "CSV"], timeout=5)
+            return [int(row[1]) for row in csv.reader(io.StringIO(r.stdout or ""))
+                    if len(row) > 1 and row[0].lower() == "llama-server.exe" and row[1].isdigit()]
+        r = rc(["pgrep", "-x", "llama-server"], timeout=5)
+        return [int(x) for x in (r.stdout or "").split() if x.isdigit()]
+    except Exception:
+        return []
+
+
+def wait_for_vram_release(timeout: float = 5.0) -> list:
+    """等残留的 llama-server 退出（显存随进程退出才归还）。返回仍存活的 PID。
+
+    旧进程还占着显存时启动，--fit 会按偏少的空闲显存规划，把层挤到 CPU，
+    吐字速度掉到满速的 1/3 左右 —— "第一次快、重开变慢"的典型原因。
+    """
+    deadline = time.time() + timeout
+    pids = running_llama_servers()
+    while pids and time.time() < deadline:
+        time.sleep(0.5)
+        pids = running_llama_servers()
+    return pids
 
 
 def _safe_int(val, default: int) -> int:
@@ -1074,7 +1240,12 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         elif is_qwen38_flash_next(model, meta) and not _config_bool(pc.get("allow_experimental_mtp", False)):
             warn.append("Flash-Next 的 llama.cpp MTP 路径仍属实验实现；默认不启用，如需测试请显式设置 allow_experimental_mtp=true")
         elif spec_setting in ("auto", "true", "on", "1", "mtp", "draft-mtp"):
-            if mtp_available and spec_mtp_supported:
+            if mtp_available and spec_mtp_supported and not tuning["gpu_fits_mtp"]:
+                # 实测：权重已有层留在 CPU 时再开 MTP，MTP 层和草稿缓冲会再挤走几层，
+                # 结果更慢（NVFP4 12.8 -> 7.0 t/s，IQ4_XS@64k 12.7 -> 5.0 t/s）
+                warn.append("显存放不下全部权重 + MTP 层，已跳过 draft-mtp（此时开启实测反而更慢）；"
+                            "换用更小的量化档位或调小上下文后即可启用")
+            elif mtp_available and spec_mtp_supported:
                 spec_mtp_enabled = True
                 warn.append(
                     "已启用 draft-mtp 推测解码：代码场景实测可达 1.4-2.1 倍，"
@@ -1086,8 +1257,24 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
         else:
             warn.append(f"未知 speculative 类型: {spec_setting}，已跳过")
 
+    # ctx_size=0：交给 llama.cpp --fit 在"全部层驻留 GPU"的前提下取最大上下文，
+    # 缩到 min_ctx_size 仍装不下才开始把层卸到 CPU。显式上下文则会被原样保留，
+    # 装不下时 --fit 只能卸层 —— 这正是吐字从满速掉到 1/3 的常见原因。
+    if ctx_size <= 0 and gpu.get("selected_backend") == "cpu":
+        # 纯 CPU 没有显存可适配，0 会让 llama.cpp 用模型原生上下文（可达 256K），内存吃不消
+        ctx_size = tuning["min_ctx"]
+    elif ctx_size <= 0 and not (supports(binary, "--fit") and supports(binary, "--fit-ctx")):
+        ctx_size = tuning["min_ctx"]
+        warn.append(f"当前 llama.cpp 不支持自动适配上下文，ctx_size=0 已按 {ctx_size} 处理")
+    elif ctx_size <= 0:
+        # 注意不能传 --ctx-size 0：实测 llama.cpp 会把显式的 0 当成"要求模型完整上下文"
+        # （日志 user has requested full context size of 262144 -> no change），
+        # 于是不缩上下文、改为卸层，27B 直接掉到 2 t/s。只有不传才会自动适配。
+        common += ["--fit-ctx", str(tuning["min_ctx"])]
+    if ctx_size > 0:
+        common += ["--ctx-size", str(ctx_size)]
+
     common += [
-        "--ctx-size",        str(ctx_size),
         "--temp",            str(sp.get("temperature", 0.7)),
         "--top-k",           str(_safe_int(sp.get("top_k"), 20)),
         "--top-p",           str(sp.get("top_p", 0.8)),
@@ -1201,7 +1388,7 @@ def runtime(cfg: dict, mode: str, vision=False) -> dict:
                 spec_types += ",ngram-map-k"
             args += ["--spec-type", spec_types]
             if supports(binary, "--spec-draft-n-max"):
-                args += ["--spec-draft-n-max", str(_safe_int(pc.get("spec_draft_n_max", 3), 3) or 3)]
+                args += ["--spec-draft-n-max", str(_safe_int(pc.get("spec_draft_n_max", 2), 2) or 2)]
             if supports(binary, "--spec-draft-ngl"):
                 args += ["--spec-draft-ngl", str(pc.get("spec_draft_ngl", "auto") or "auto")]
             if pc.get("ctx_checkpoints", None) is not None and supports(binary, "--ctx-checkpoints"):
@@ -1318,11 +1505,21 @@ def summary(rt: dict, mode: str, vision: bool):
             f"   性能策略: {tuning.get('profile', 'auto')} | KV {tuning.get('cache_type_k')}/{tuning.get('cache_type_v')}"
             f" | 显存余量 {tuning.get('fit_target_mb', 0)}MB"
         )
+        if gpu.get("selected_backend") == "cuda" and tuning.get("gpu_weight_mb"):
+            print(
+                f"   显存内权重: {tuning['gpu_weight_mb'] / 1024:.1f}GB | "
+                + ("可全部驻留 GPU（满速）" if tuning.get("gpu_fits") else "放不下，部分层会留在 CPU（降速）")
+            )
     if rt["layers"] == -1: print("   GPU 卸载层数: auto")
     elif rt["layers"] > 0: print(f"   GPU 卸载层数: {rt['layers']}")
     if mode == "server": print(f"   服务模式: {'vision+text' if vision else 'text'} | http://{rt['host']}:{rt['port']}")
     if mode == "server" and vision and rt.get("mmproj"): print(f"   视觉模块: {rt['mmproj']}")
     for w in rt["warn"]: print(f"   注意: {w}")
+    # 模型装不下、或上下文按显存自动取值时，腾出的每 MiB 显存都直接变成更多层或更长上下文
+    if gpu.get("selected_backend") == "cuda" and tuning and (
+            not tuning.get("gpu_fits") or "--ctx-size" not in rt["args"]):
+        if note := vram_hog_note(meta, tuning.get("cache_type_k", "q8_0")):
+            print(f"   显存: {note}")
 
 
 def cmd_chat(cfg: dict) -> int:
@@ -1334,6 +1531,9 @@ def cmd_chat(cfg: dict) -> int:
 
 
 def cmd_server(cfg: dict, vision=False) -> int:
+    if leftover := wait_for_vram_release():
+        print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
+              "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
     rt = runtime(cfg, "server", vision)
     print("启动 API 服务...")
     summary(rt, "server", vision)
@@ -1397,6 +1597,9 @@ def cmd_server(cfg: dict, vision=False) -> int:
 
 
 def cmd_server_background(cfg: dict, vision=False) -> int:
+    if leftover := wait_for_vram_release():
+        print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
+              "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
     rt = runtime(cfg, "server", vision)
     summary(rt, "server", vision)
     try:
@@ -1486,6 +1689,9 @@ def cmd_stop() -> int:
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
             if r.returncode == 0:
+                deadline = time.time() + 15
+                while time.time() < deadline and pid in running_llama_servers():
+                    time.sleep(0.5)
                 print(f"已停止服务 (PID: {pid})")
             else:
                 # taskkill 返回 128 表示进程不存在

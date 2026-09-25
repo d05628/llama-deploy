@@ -2,6 +2,82 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.0] - 2026-09-25
+
+修复"重开后吐字从满速掉到 1/3"：根因是有层被挤到 CPU，而 llama.cpp 全程不提示。
+实测数据见 [性能调优日志](docs/performance-tuning.md) 第 10 节。
+
+### 新增
+
+- **`ctx_size: 0` 自动上下文（新默认）**。在权重全部驻留 GPU 的前提下取显存允许的最大
+  上下文，缩到 `performance.min_ctx_size`（默认 8192）仍装不下才卸层。
+  IQ4_XS 在 16GB 卡上：原 `ctx 65536` 只放下 62/66 层、12.7 t/s；自动上下文取
+  51456、66/66 层、**27.0 t/s**。纯 CPU 后端按 `min_ctx_size` 处理。
+
+### 修复
+
+- **显存预算按真正进显存的权重计算。** 此前用文件体积，把始终留在 CPU 的 `token_embd`
+  和未启用时不加载的 MTP 层都算了进去（NVFP4：16332 vs 实际 15098 MiB）。
+  诊断现在给出具体差多少 MiB。
+- **权重装不下时不再启用 MTP。** 实测此时开 MTP 更慢（12.8 → 7.0 t/s，12.7 → 5.0 t/s）。
+- **MTP 显存估算**计入混合架构每个草稿 token 的循环状态拷贝（约 155 MiB/个）。
+- **停止服务后等进程真正退出**再返回，避免立刻重启时少算空闲显存；启动时检测残留的
+  llama-server 并警告。
+
+### 引擎更新：一键适配最新环境，保留回退
+
+- **CUDA 包按主版本匹配驱动。** 此前要求包版本 ≤ 驱动报告的 CUDA 版本，驱动 581.80（CUDA 13.0）
+  会错过 cuda-13.4 包、退回不含 sm_120 的 12.4。CUDA 次版本兼容保证同主版本可运行，已实测。
+  RTX 50 上 NVFP4 提示词处理因此 **+44%**、吐字 +10%；K-quant 基本持平（+1~2%）。
+- **升级验证要求新引擎能识别 GPU**（`--list-devices`），否则视为失败并自动回滚。
+- **升级成功后保留上一版本**为 `llama.cpp.previous`，新增 `python deploy.py --rollback-llama`
+  在两版之间互换。
+- 管理器新增「推理引擎」卡片：当前版本与 CUDA 变体、最新版本、可回退版本，一键升级 / 一键回退。
+
+### 一键启动 Agent（本地模型）
+
+管理器「部署」页新增「一键启动 Agent」：自动启动模型服务与兼容网关，读取实际上下文长度，
+在新窗口打开所选工具。支持 **Qwen Code（推荐）、Claude Code、Codex、OpenCode、Gemini CLI、Aider**。
+
+- **不影响官方通道**：环境变量只写进生成的启动器（`agents/launch-*.cmd`），不改系统环境变量；
+  每个工具使用 `agents/<id>/` 下独立的配置目录（`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `QWEN_HOME` /
+  `GEMINI_CLI_HOME` / `XDG_*`），官方的登录、配置和会话历史互不混用。实测前后官方配置文件零改动。
+- 按实际上下文告诉各工具真实窗口（`CLAUDE_CODE_MAX_CONTEXT_TOKENS`、Codex `model_context_window`、
+  Qwen Code `contextWindowSize` 等），自动压缩会在撑爆前触发。
+- 可选「需要看图」：视觉模块放 CPU，不占显存、不缩上下文。
+- 自动把本机最新版 Blender 加入该窗口的 PATH。
+- 实测 5 个已安装工具都能通过本地模型完成"用工具写文件"的任务。
+
+### 兼容网关修复（均由上面的端到端测试发现）
+
+- **流式 chat completions 返回 502**：网关把上游 SSE 当 JSON 解析。Qwen Code、OpenCode 等流式客户端
+  全部不可用。现原样透传。
+- **Responses 流缺少事件、工具调用丢失**：Codex 报 `OutputTextDelta without active item`。
+  现按协议完整回放 `output_item.added` / `content_part` / `function_call_arguments` 等事件。
+  Responses 未指定 `max_output_tokens` 时不再默认截断在 1024。
+- **Gemini 工具调用失败**：流式路径丢弃工具调用；新版 Gemini CLI 用 `parametersJsonSchema`
+  声明参数，网关只读 `parameters`，模型看不到参数定义。
+- **工具调用历史被压平成文本**（Anthropic / Responses / Gemini 三条路径）：模型看到的是
+  `[tool_use ...]` 文字记录，多步任务里会模仿文本而不真正调用工具。现转成真实的
+  `tool_calls` / `tool` 消息。
+- **图片被丢弃**：四种协议的图片现在都能透传给开了视觉的模型服务；工具读回的图片
+  （如 agent 查看截图）也能送达。未开视觉时换成提示文字，不再把 base64 塞进提示词。
+- **长回复无限重试**：网关对 Anthropic / Responses / Gemini 工具请求是先等上游完整生成再回放，
+  agent 一次写出整个脚本要 2-3 分钟，其间一个字节都不发，客户端判定连接空闲、断开并原样重发——
+  实测 Claude Code 把同一请求重发几十次后报 "Request timed out"。现在立即发出开始事件，
+  等待期间每 5 秒一次心跳（Anthropic `ping` 事件 / SSE 注释行）。
+- **网关 PID 被复用时误判**：重启后旧 PID 落到了 `conhost.exe`，`start` 误报"已在运行"，
+  `stop` 会直接杀掉无关进程。现核对进程名，过期 PID 只清理文件、绝不 kill。
+- Claude Code 启动器设置 `CLAUDE_CODE_GLOB_TIMEOUT_SECONDS=600`：默认 20 秒，
+  实测 20 万目录的数据盘全盘搜索要 6–8 分钟。
+
+### 调整
+
+- `spec_draft_n_max` 默认 3 → 2：上下文多约 47%（15104 → 22272），散文速度不变，
+  代码 63 → 55 t/s。
+
+---
+
 ## [1.4.0] - 2026-09-05
 
 性能档位化。在**不牺牲输出保真度**的前提下，代码场景吐字速度从 16.3 提升到

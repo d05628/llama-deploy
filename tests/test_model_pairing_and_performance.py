@@ -1,3 +1,4 @@
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -540,6 +541,124 @@ class PerformanceDetectionTests(unittest.TestCase):
         self.assertLessEqual(
             13500 + run.kv_cache_mb(meta, advised, "q8_0", "q8_0") + 600, 14919
         )
+
+    @staticmethod
+    def _write_gguf(path, tensors, alignment=32):
+        """写一个最小 GGUF v3：只有 general.alignment 和按顺序排列的 F32 一维张量。"""
+        def s(text):
+            raw = text.encode()
+            return struct.pack("<Q", len(raw)) + raw
+        header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 1)
+        header += s("general.alignment") + struct.pack("<II", 4, alignment)
+        offset, data = 0, b""
+        for name, n_bytes in tensors:
+            header += s(name) + struct.pack("<I", 1) + struct.pack("<Q", n_bytes // 4)
+            header += struct.pack("<IQ", 0, offset)
+            padded = -(-n_bytes // alignment) * alignment
+            data += b"\0" * padded
+            offset += padded
+        header += b"\0" * (-len(header) % alignment)
+        path.write_bytes(header + data)
+
+    def test_gpu_weight_excludes_cpu_embedding_and_idle_mtp_layer(self):
+        # 文件体积会高估显存需求：token_embd 始终留在 CPU，MTP 层不开推测解码时不加载。
+        # 实测 NVFP4 文件 16332MiB，真正进显存 15098MiB；按文件体积算会误判差距。
+        mib = 1024 * 1024
+        meta = {"block_count": 2, "nextn_predict_layers": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            self._write_gguf(path, [
+                ("token_embd.weight", 3 * mib),
+                ("blk.0.ffn_up.weight", 5 * mib),
+                ("output.weight", 2 * mib),
+                ("blk.1.nextn.eh_proj.weight", 1 * mib),
+            ])
+            run.TENSOR_SIZE_CACHE.clear()
+            self.assertAlmostEqual(run.gpu_weight_mb(path, meta), 7.0, places=3)
+            self.assertAlmostEqual(run.gpu_weight_mb(path, meta, mtp_enabled=True), 8.0, places=3)
+
+    def test_auto_context_is_budgeted_at_its_floor(self):
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+            "compute_capability": "12.0",
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=12726), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                {"profile": "balanced"}, 0,
+            )
+        self.assertTrue(tuning["gpu_fits"])
+        self.assertEqual(tuning["min_ctx"], 8192)
+        self.assertIn("自动适配", " ".join(tuning["notes"]))
+
+    def test_mtp_is_not_offered_when_weights_already_spill(self):
+        # 实测：权重已有层留在 CPU 时再开 MTP 反而更慢（12.8 -> 7.0 t/s）
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+            "compute_capability": "12.0",
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=15099), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-iMatrix-NVFP4-MTP.gguf"), self._qwen38_meta(), gpu,
+                {"profile": "speed"}, 0,
+            )
+        self.assertFalse(tuning["gpu_fits"])
+        self.assertFalse(tuning["gpu_fits_mtp"])
+        self.assertIn("差约", " ".join(tuning["notes"]))
+
+    def test_mtp_is_offered_when_everything_fits(self):
+        # 实测 IQ4_XS 全驻留 + MTP：代码 63 t/s、散文 39 t/s（不开 MTP 为 27 t/s）
+        gpu = {
+            "selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+            "compute_capability": "12.0",
+        }
+        with mock.patch.object(run, "model_size_mb", return_value=12726), mock.patch.object(
+            run, "meminfo", return_value={"avail_gb": 60}
+        ):
+            tuning = run.performance_tuning(
+                Path("Qwen3.8-27B-UD-IQ4_XS.gguf"), self._qwen38_meta(), gpu,
+                {"profile": "speed"}, 0,
+            )
+        self.assertTrue(tuning["gpu_fits_mtp"])
+
+    def test_auto_context_never_passes_an_explicit_zero(self):
+        # llama.cpp 把显式的 --ctx-size 0 当成"要求模型完整上下文"（262144），
+        # 不缩上下文而是卸层，实测 27B 掉到 2.3 t/s。自动模式只能不传该参数。
+        help_text = "-ngl, --gpu-layers N  max layers: 'auto', 'all'\n--fit on\n--fit-target\n--fit-ctx\n-fa\n-b\n-ub"
+        gpu = {"selected_backend": "cuda", "vram_mb": 16311, "vram_free_mb": 14919,
+               "compute_capability": "12.0"}
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "llama-server.exe"
+            binary.write_bytes(b"")
+            model = Path(tmp) / "Qwen3.8-27B-UD-IQ4_XS.gguf"
+            model.write_bytes(b"")
+            cfg = {"model": {"model_file": model.name}, "server": {"ctx_size": 0},
+                   "performance": {"profile": "balanced"}}
+            with mock.patch.object(run, "find_binary", return_value=binary), \
+                    mock.patch.object(run, "resolve_model", return_value=model), \
+                    mock.patch.object(run, "gguf_meta", return_value=self._qwen38_meta()), \
+                    mock.patch.object(run, "accel", return_value=gpu), \
+                    mock.patch.object(run, "help_text", return_value=help_text), \
+                    mock.patch.object(run, "model_size_mb", return_value=12726), \
+                    mock.patch.object(run, "meminfo", return_value={"avail_gb": 60}):
+                args = run.runtime(cfg, "server")["args"]
+        self.assertNotIn("--ctx-size", args)
+        self.assertEqual(args[args.index("--fit-ctx") + 1], "8192")
+
+    def test_vram_hog_note_skips_desktop_and_llama_and_converts_to_context(self):
+        consumers = [("llama-server.exe", 15022), ("dwm.exe", 274), ("NVIDIA Overlay.exe", 195),
+                     ("Code.exe", 153), ("csrss.exe", 65)]
+        with mock.patch.object(run, "gpu_memory_consumers", return_value=consumers):
+            note = run.vram_hog_note(self._qwen38_meta(), "q4_0")
+        self.assertIn("348MiB", note)
+        self.assertIn("NVIDIA Overlay", note)
+        self.assertNotIn("dwm", note)
+        self.assertNotIn("llama-server", note)
+        self.assertIn("K 上下文", note)
 
     def test_moe_layer_estimate_uses_resident_weight_size(self):
         gpu = {"vram_free_mb": 6144}

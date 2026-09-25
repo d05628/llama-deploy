@@ -19,7 +19,7 @@
     "host": "0.0.0.0",
     "port": 8080,
     "threads": 0,
-    "ctx_size": 8192,
+    "ctx_size": 0,
     "enable_thinking": false,
     "reasoning_budget": 512
   },
@@ -60,7 +60,8 @@
     "cache_type_k": "auto",
     "cache_type_v": "auto",
     "spec_type": "off",
-    "spec_draft_n_max": 3,
+    "spec_draft_n_max": 2,
+    "min_ctx_size": 8192,
     "spec_draft_ngl": "auto",
     "allow_experimental_mtp": false,
     "kv_unified": true,

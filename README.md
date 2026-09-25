@@ -99,15 +99,44 @@ python run.py status
 
 ### 更新 llama.cpp
 
-先停止 `llama-server`、`llama-cli` 等所有 llama.cpp 进程，然后在 Web 管理器中点击「升级 llama.cpp」，或执行：
+先停止 `llama-server`、`llama-cli` 等所有 llama.cpp 进程，然后在 Web 管理器「部署」页的
+「推理引擎」卡片中点击「一键升级到最新」，或执行：
 
 ```bash
-python deploy.py --upgrade-llama
+python deploy.py --upgrade-llama     # 升级到最新
+python deploy.py --rollback-llama    # 换回上一版本（再执行一次即可换回新版）
 ```
 
-更新器会扫描官方最新的完整 nightly Release，精确匹配操作系统、CPU 架构和 CPU/CUDA/Vulkan 后端。CUDA 主包与对应版本的运行时会成对下载；镜像失效时自动回退 GitHub 官方直链。旧引擎只有在下载、解压和两个程序的版本验证全部成功后才会删除，失败会自动回滚。
+更新器会扫描官方最新的完整 nightly Release，精确匹配操作系统、CPU 架构和 CPU/CUDA/Vulkan 后端。
+CUDA 包按**主版本**匹配驱动（CUDA 次版本兼容：驱动 ≥ 580 可运行任意 13.x），RTX 50 系因此能拿到
+带 sm_120 原生内核的 CUDA 13 包。CUDA 主包与对应版本的运行时会成对下载；镜像失效时自动回退 GitHub 官方直链。
+
+安全机制：
+
+- 新引擎必须通过版本检查，且 `--list-devices` 能识别到 GPU，才算升级成功——驱动不匹配导致
+  静默退回 CPU 的情况会被当作失败并**自动回滚**。
+- 升级成功后，上一版本保留为 `llama.cpp.previous`，管理器里可随时「回退到上一版本」。
 
 匿名 GitHub API 被限流时会自动改用官方 Release feed。也可以通过 `GITHUB_TOKEN` 或 `GH_TOKEN` 环境变量提供只读 Token 以提高 API 配额；Token 不应写入 `config.jsonc`。
+
+---
+
+## 🤖 一键启动 Agent
+
+在 Web 管理器「部署」页的「一键启动 Agent」里选择工作目录和工具，即可用本地模型打开：
+
+| 工具 | 说明 |
+|---|---|
+| **Qwen Code**（推荐） | Qwen 官方 CLI agent，工具调用格式针对 Qwen 模型调优 |
+| Claude Code / Codex / OpenCode | 通过兼容网关使用本地模型 |
+| Aider | 以 git 为中心、提示词精简，适合上下文有限的场景 |
+| Gemini CLI | 可用；其提示词针对 Gemini 调优，本地 Qwen 下偶有工具路径出错 |
+
+只影响这一个窗口：环境变量写在 `agents/launch-*.cmd` 里，配置放在 `agents/<工具>/` 下独立目录，
+官方登录与配置不受影响——平时直接运行 `claude`、`codex` 等仍走官方通道。启动器可以直接双击重复使用。
+
+agent 的系统提示与工具定义约占 1–2 万 token，建议使用 `ctx_size: 0` 并选择能提供 4 万以上上下文的配置；
+勾选「需要看图」时视觉模块放 CPU，不占显存。
 
 ---
 
@@ -190,14 +219,15 @@ Qwen3-VL-8B-Q4_K_M.mmproj-f16.gguf
 | `server.host` | 监听地址 | `0.0.0.0` |
 | `server.port` | 监听端口 | `8080` |
 | `server.threads` | CPU 线程数（0=自动） | `0` |
-| `server.ctx_size` | 上下文长度 | `8192` |
+| `server.ctx_size` | 上下文长度；`0` = 在权重全部驻留显存的前提下自动取最大值 | `0` |
 | `server.enable_thinking` | 思考/推理模式 | `false` |
 | `server.reasoning_budget` | 思考 token 预算（`-1` 为不限制） | `512` |
 
 > 💡 **`ctx_size` 是显存吃紧时影响速度最大的参数。** 它决定 KV cache 占用，
 > 而 KV cache 每多占 1GB，就有若干层权重被挤到 CPU 上，吐字速度成倍下降。
-> 启动时如果看到显存预算警告，请优先调整它。实测数据与调优方法见
-> [性能调优日志](docs/performance-tuning.md)。
+> 启动时如果看到显存预算警告，请优先调整它。推荐保持 `0`：启动时由 llama.cpp
+> 先缩小上下文、保证全部层留在 GPU，缩到 `performance.min_ctx_size`（默认 8192）
+> 仍装不下才会卸层。实测数据与调优方法见 [性能调优日志](docs/performance-tuning.md)。
 
 ### 采样参数
 
@@ -209,7 +239,7 @@ Qwen3-VL-8B-Q4_K_M.mmproj-f16.gguf
 | `sampling.presence_penalty` | 重复惩罚（防止重复） | `1.5` |
 | `sampling.max_tokens` | 单次最大生成数 | `2048` |
 | `performance.spec_type` | speculative decoding（可手动设 `draft-mtp` 测 MTP/nextn 模型） | `off` |
-| `performance.spec_draft_n_max` | MTP 单步草稿 token 数 | `3` |
+| `performance.spec_draft_n_max` | MTP 单步草稿 token 数 | `2` |
 | `performance.profile` | `auto` 自适应 / `maximum` 极限显存利用 / `compatible` 兼容优先 | `auto` |
 | `performance.cache_type_k/v` | KV cache 类型；`auto` 在显存高压或长上下文时自动采用 `q8_0` | `auto` |
 | `performance.batch_size` / `ubatch_size` | `0` 交给新版 llama.cpp 按设备自动拟合；非零为手动固定值 | `0` |

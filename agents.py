@@ -17,27 +17,34 @@ from pathlib import Path
 IS_WIN = platform.system() == "Windows"
 
 AGENTS = {
-    # Qwen Code 是 Qwen 官方的 CLI agent，工具调用格式针对 Qwen 系列调过，本地跑 Qwen 模型首选
-    "qwen": {"name": "Qwen Code", "command": "qwen", "tag": "推荐",
-             "desc": "Qwen 官方出品，工具调用针对 Qwen 模型调优；能写代码、读写文件、执行命令，开「看图」后可操作桌面软件",
+    # 顺序与简介依据 agent_bench/ 实测（Qwen3.8-27B IQ4_XS，RTX 5060 Ti 16GB，2026-09-26）
+    "codex": {"name": "Codex", "command": "codex", "tag": "推荐·最准",
+              "desc": "OpenAI 出品。实测四题全过，理解最准（电影解读能从台词推断出人物）。"
+                      "改代码、跑命令都在沙箱里，只能写工作目录。适合要求准确的任务",
+              "install": "npm install -g @openai/codex"},
+    "opencode": {"name": "OpenCode", "command": "opencode", "tag": "推荐·最快",
+                 "desc": "开源、界面美观。实测四题全过且最快（修 bug 1.5 分钟），Blender 动画做得最好。"
+                         "适合日常编程与自动化，效率优先",
+                 "install": "npm install -g opencode-ai@latest"},
+    # Qwen Code 是 Qwen 官方的 CLI agent，工具调用格式针对 Qwen 系列调过
+    "qwen": {"name": "Qwen Code", "command": "qwen", "tag": "交互推荐",
+             "desc": "Qwen 官方出品，工具调用针对 Qwen 模型调优，边聊边确认的体验最好；开「看图」后可操作桌面软件。"
+                     "注意：别开全自动批准——实测它的命令白名单在自动模式下不生效",
              "install": "npm install -g @qwen-code/qwen-code@latest"},
     "claude": {"name": "Claude Code", "command": "claude",
-               "desc": "Anthropic 出品，功能最全的编程 agent（子任务、计划模式、MCP）；提示词较长，本地模型下偶尔会在同一条命令上反复重试",
+               "desc": "Anthropic 出品，功能最全（子任务、计划模式、MCP）。实测四题全过，"
+                       "但偶有过度推断（认错人）和构图欠佳",
                "install": "npm install -g @anthropic-ai/claude-code"},
-    "codex": {"name": "Codex", "command": "codex",
-              "desc": "OpenAI 出品，偏重在沙箱里改代码、跑命令，操作前会征求确认",
-              "install": "npm install -g @openai/codex"},
-    # 提示词针对 Gemini 模型调过：实测本地 Qwen 工具调用 3 次成功 2 次，偶尔把文件写到它的临时目录
-    "gemini": {"name": "Gemini CLI", "command": "gemini", "tag": "不推荐",
-               "desc": "Google 出品；提示词针对 Gemini 调优，本地 Qwen 下偶尔把文件写到它自己的临时目录（Qwen Code 是它的 Qwen 调优分支）。若弹出登录选项，选「2. Use Gemini API Key」即可，无需登录 Google",
-               "install": "npm install -g @google/gemini-cli"},
-    "opencode": {"name": "OpenCode", "command": "opencode",
-                 "desc": "开源、界面美观，内置 plan/build 两种模式，支持任意 OpenAI 兼容模型",
-                 "install": "npm install -g opencode-ai@latest"},
     # Aider 以 git 为中心、提示词精简，适合上下文有限的本地模型
-    "aider": {"name": "Aider", "command": "aider",
-              "desc": "以 git 为中心的结对编程工具：改文件无需逐次确认，每次改动自动 git 提交（/undo 可撤销）；不会执行命令（如渲染需自己运行），提示词精简",
+    "aider": {"name": "Aider", "command": "aider", "tag": "只改代码",
+              "desc": "以 git 为中心：改文件自动确认、每次改动自动提交（/undo 撤销）。实测修 bug 最快（1 分钟）；"
+                      "不执行命令、不看图，适合纯代码修改",
               "install": "python -m pip install aider-install && aider-install"},
+    # 提示词针对 Gemini 模型调过；Qwen Code 是它针对 Qwen 调优的分支
+    "gemini": {"name": "Gemini CLI", "command": "gemini", "tag": "备用",
+               "desc": "Google 出品。实测 SVG 画得最好，但提示词针对 Gemini 调优、命令白名单在自动模式下不生效。"
+                       "若弹出登录选项，选「Use Gemini API Key」即可，无需登录 Google",
+               "install": "npm install -g @google/gemini-cli"},
 }
 
 # 启动器里的值会被 cmd 解析，这些字符无法安全地写进 set 语句
@@ -174,6 +181,11 @@ def codex_config(gateway: str, alias: str, n_ctx: int) -> str:
         f'base_url = "{gateway}/v1"\n'
         'wire_api = "responses"\n'
         'env_key = "LLAMA_DEPLOY_API_KEY"\n'
+        + (
+            # Windows 上不配沙箱时，workspace-write 会被强制降为只读（"read-only under a managed
+            # profile"），Codex 改不了任何文件、命令也被拒绝。unelevated 沙箱无需管理员提权，实测可写工作目录。
+            '\n[windows]\nsandbox = "unelevated"\n' if IS_WIN else ""
+        )
     )
 
 

@@ -640,6 +640,10 @@ def openai_to_anthropic(resp: dict, cfg: dict, model_name: str = "", tool_schema
     tool_calls = message.get("tool_calls") or []
     tool_schemas = tool_schemas or {}
     accepted_tool_calls = 0
+    # Anthropic 的惯例：模型的说明文字在前、工具调用在后
+    text = message.get("content") or ""
+    if text:
+        content_blocks.append({"type": "text", "text": text})
     for call in tool_calls:
         fn = call.get("function") or {}
         tool_name = fn.get("name", "")
@@ -649,11 +653,12 @@ def openai_to_anthropic(resp: dict, cfg: dict, model_name: str = "", tool_schema
             raw_args = fn.get("arguments", "")
         args, err = sanitize_tool_call(tool_name, raw_args, tool_schemas.get(tool_name, {}))
         if args is None:
-            content_blocks.append({
-                "type": "text",
-                "text": f"[兼容网关已拦截一个无效工具调用: {tool_name or 'unknown'} ({err})]",
-            })
-            continue
+            # 修不好的调用（如缺必填参数）原样交给客户端，由它做参数校验并把错误回给模型，
+            # 模型据此改正重试——与接真实 API 时一致。此前改写成一段说明文字，客户端会把它当成
+            # "回答完毕"直接结束：实测 Claude Code 渲染报错后本该修脚本，却因此提前收工。
+            if not tool_name:
+                continue
+            args = raw_args if isinstance(raw_args, dict) else {}
         accepted_tool_calls += 1
         content_blocks.append({
             "type": "tool_use",
@@ -661,9 +666,6 @@ def openai_to_anthropic(resp: dict, cfg: dict, model_name: str = "", tool_schema
             "name": tool_name,
             "input": args,
         })
-    text = message.get("content") or ""
-    if text:
-        content_blocks.append({"type": "text", "text": text})
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
     finish = choice.get("finish_reason") or "stop"
@@ -1462,9 +1464,13 @@ class CompatHandler(BaseHTTPRequestHandler):
                 # 带工具的请求：流式路径只转发文本增量，工具调用会丢失，Gemini CLI 报
                 # "empty response or malformed tool call"。改为完整取回后作为一个 SSE 事件发出。
                 self._sse_headers()
+                # Gemini 的 SSE 解析器要求每段都以 "data: " 开头（/^\s*data: (.*)\n\n/），
+                # 注释行心跳会卡在缓冲区里、把后面的数据全部堵住，最终报
+                # "Incomplete JSON segment at the end"。心跳改为只带用量统计、不含候选内容的 data 行。
+                beat = b'data: {"usageMetadata": {"promptTokenCount": 0, "totalTokenCount": 0}}\n\n'
                 try:
                     status, upstream = self._wait_with_heartbeat(
-                        lambda: self._call_openai_chat(openai_payload, cfg), b": keepalive\n\n")
+                        lambda: self._call_openai_chat(openai_payload, cfg), beat)
                     payload = (openai_to_gemini(upstream) if status < 400 else
                                {"error": {"message": str(upstream.get("error", upstream)
                                                          if isinstance(upstream, dict) else upstream),

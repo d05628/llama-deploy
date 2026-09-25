@@ -89,6 +89,11 @@ class AgentIsolationTests(unittest.TestCase):
                 self.assertIs(model["attachment"], vision)
                 self.assertEqual("image" in model["modalities"]["input"], vision)
 
+    def test_codex_gets_a_windows_sandbox_so_it_can_write(self):
+        # 不配时 workspace-write 被降为只读："read-only under a managed profile"
+        with mock.patch.object(agents, "IS_WIN", True):
+            self.assertIn('[windows]\nsandbox = "unelevated"', agents.codex_config(GATEWAY, "local", 88064))
+
     def test_codex_skips_the_daemon_that_refuses_elevated_windows(self):
         with mock.patch.object(agents, "IS_WIN", True):
             self.assertIn("--no-daemon", agents.command_args("codex", Path("h"), "local"))

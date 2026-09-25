@@ -51,7 +51,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"
@@ -2137,6 +2137,10 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             ram = float(params.get("ram", "4"))
             vram = int(params.get("vram", "0"))
             vram_free = int(params.get("vram_free", "0"))
+            if deploy_mgr.get_server_status().get("server_running"):
+                # 模型服务自己占着显存：此时的"空闲显存"接近 0，会得出"权重 ≤0.0GB 可驻留"的荒谬建议。
+                # 改按整卡容量估算（gpu_weight_budget_gb 在 free 为 0 时按总显存的 92% 计）
+                vram_free = 0
             self._json_resp(get_recommendations(ram, vram, vram_free))
 
         elif path == "/api/models":
@@ -2849,7 +2853,7 @@ a{color:var(--primary);text-decoration:none}
         <div class="card-title">🤖 一键启动 Agent（本地模型）</div>
         <div class="form-hint">自动启动模型服务与兼容网关，并在新窗口打开所选工具。只对这个窗口生效、使用独立配置目录，
           不改动官方配置和登录；平时直接运行 claude / codex / gemini 等仍走官方通道。
-          跑 Qwen 模型首选 Qwen Code（Qwen 官方出品，工具调用格式针对 Qwen 调优）。</div>
+          没装的工具点按钮即可复制安装命令。</div>
         <div class="form-group" style="margin-top:10px">
           <label class="form-label" for="agentCwd">工作目录（agent 在这里读写代码）</label>
           <input class="form-input" id="agentCwd" type="text" placeholder="例如 D:\projects\my-app">
@@ -2857,6 +2861,8 @@ a{color:var(--primary);text-decoration:none}
         <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px;cursor:pointer">
           <input type="checkbox" id="agentVision" checked> 允许看图（截图、操作桌面软件、视频画面等）：视觉模块放 CPU，不占显存、不缩上下文，每张图多花几秒
         </label>
+        <div class="form-hint" style="margin-bottom:8px">按用途选：要准 → <b>Codex</b>；要快 → <b>OpenCode</b>；
+          想边聊边确认 → <b>Qwen Code</b>；只改代码 → <b>Aider</b>。简介里的"实测"来自 agent_bench/ 测试题组。</div>
         <div id="agentButtons" style="display:flex;gap:10px;flex-wrap:wrap">加载中...</div>
         <div id="agentState" class="form-hint" style="margin-top:8px"></div>
         <div style="margin-top:10px">
@@ -2983,6 +2989,13 @@ async function init(){
     (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
   await loadDefaultCfg();
   loadConfig();pollStatus();updateSystemPage();loadEngineInfo();loadAgents();
+  // 支持 #deploy 这类地址直接打开对应页面（可收藏）
+  var hashPage=location.hash.replace('#','');
+  if(hashPage&&document.getElementById('page-'+hashPage)){
+    var navEl=Array.prototype.filter.call(document.querySelectorAll('.nav-item'),function(n){
+      return (n.getAttribute('onclick')||'').indexOf("'"+hashPage+"'")>=0})[0];
+    switchPage(hashPage,navEl);
+  }
   document.addEventListener('change',function(e){if(e.target&&e.target.id&&e.target.id.indexOf('cfg-')===0)renderPresets()});
   var vram=sysInfo.gpu_vram_mb||0;
   var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
@@ -3678,7 +3691,7 @@ async function loadAgents(){
   box.style.display='grid';box.style.gridTemplateColumns='repeat(auto-fit,minmax(260px,1fr))';
   box.innerHTML=r.agents.map(function(a){
     var btn=a.installed
-      ?'<button class="btn '+(a.tag==='不推荐'?'btn-ghost':'btn-primary')+'" onclick="launchAgent('+esc(JSON.stringify(a.id))+')">▶️ '+esc(a.name)+(a.tag?'（'+esc(a.tag)+'）':'')+'</button>'
+      ?'<button class="btn '+(a.tag==='备用'?'btn-ghost':'btn-primary')+'" onclick="launchAgent('+esc(JSON.stringify(a.id))+')">▶️ '+esc(a.name)+(a.tag?'（'+esc(a.tag)+'）':'')+'</button>'
       :'<button class="btn btn-ghost" title="'+esc(a.install)+'" onclick="copyText('+esc(JSON.stringify(a.install))+')">'+esc(a.name)+'（未安装，复制安装命令）</button>';
     return '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px">'+btn+
       '<div class="form-hint" style="margin-top:6px">'+esc(a.desc||'')+'</div></div>';
@@ -3802,12 +3815,13 @@ function renderLan(st){
   var managerUrl='http://'+ip+':'+location.port;
   var key=st.gateway_api_key||'local-no-key-needed';
   var alias=st.gateway_model_alias||'llama-deploy-local';
-  var claudePs='$env:ANTHROPIC_BASE_URL="'+compatBase+'"\n$env:ANTHROPIC_API_KEY="'+key+'"\n$env:ANTHROPIC_MODEL="'+alias+'"\n$env:ANTHROPIC_SMALL_FAST_MODEL="'+alias+'"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude';
-  var claudeCmd='set ANTHROPIC_BASE_URL='+compatBase+' && set ANTHROPIC_API_KEY='+key+' && set ANTHROPIC_MODEL='+alias+' && set ANTHROPIC_SMALL_FAST_MODEL='+alias+' && set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 && claude';
-  var ollamaEnv='OLLAMA_HOST='+compatBase;
-  var openaiEnv='OPENAI_BASE_URL='+compatOpenAI+'\nOPENAI_API_KEY=local-no-key-needed';
-  var codexEnv='OPENAI_BASE_URL='+compatOpenAI+'\nOPENAI_API_KEY=local-no-key-needed\ncodex';
-  var geminiPs='$env:GOOGLE_GEMINI_BASE_URL="'+compatBase+'"\n$env:GEMINI_BASE_URL="'+compatBase+'"\n$env:GEMINI_API_KEY="local-no-key-needed"\ngemini';
+  var rows=[
+    ['OpenAI 兼容','Chat Completions / Responses：Cherry Studio、Open WebUI、Continue、Codex 等',compatOpenAI],
+    ['Anthropic 兼容','Claude Code 等使用 Anthropic 协议的软件',compatBase],
+    ['Ollama 兼容','支持 Ollama 的软件，填 OLLAMA_HOST',compatBase],
+    ['Gemini 兼容','Gemini CLI 等使用 Gemini 协议的软件',compatBase],
+    ['直连模型服务','OpenAI 协议、不经网关，性能最高（不做协议转换）',openaiUrl]
+  ];
   box.innerHTML=
     '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;font-size:13px">'+
     '<div><div style="color:var(--text3)">局域网 IP</div><strong>'+esc((st.lan_ips||[]).join(' / '))+'</strong></div>'+
@@ -3815,12 +3829,16 @@ function renderLan(st){
     '<div><div style="color:var(--text3)">兼容网关</div><span class="status-dot '+(st.gateway_running?'green':'red')+'"></span> '+(st.gateway_running?'运行中':'未运行')+' · <a href="'+compatBase+'" target="_blank">'+esc(compatBase)+'</a></div>'+
     '<div><div style="color:var(--text3)">管理界面</div><a href="'+managerUrl+'" target="_blank">'+esc(managerUrl)+'</a></div>'+
     '</div>'+
-    '<div style="margin-top:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px">'+
-    '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px"><strong>Claude Code / Anthropic</strong><br><code style="word-break:break-all">'+esc(compatBase)+'</code><br><button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(claudePs))+')">复制 PowerShell</button> <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(claudeCmd))+')">复制 CMD</button></div>'+
-    '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px"><strong>Ollama API</strong><br><code style="word-break:break-all">'+esc(compatBase)+'</code><br><button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(ollamaEnv))+')">复制 OLLAMA_HOST</button></div>'+
-    '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px"><strong>OpenAI API</strong><br><code style="word-break:break-all">'+esc(openaiUrl)+'</code><br><code style="word-break:break-all">'+esc(compatOpenAI)+'</code><br><button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(openaiEnv))+')">复制环境变量</button></div>'+
-    '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px"><strong>Codex / OpenAI Responses</strong><br><code style="word-break:break-all">'+esc(compatOpenAI)+'</code><br><button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(codexEnv))+')">复制 Codex 环境</button></div>'+
-    '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px"><strong>Gemini CLI</strong><br><code style="word-break:break-all">'+esc(compatBase)+'</code><br><button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="copyText('+esc(JSON.stringify(geminiPs))+')">复制 PowerShell</button></div>'+
+    '<div class="form-hint" style="margin-top:12px">本机使用请直接用上方「一键启动 Agent」。下面的地址供局域网内其他电脑或其他软件接入：'+
+    '模型名填 <code>'+esc(alias)+'</code>，API Key 填 <code>'+esc(key)+'</code>（未启用鉴权时任意值均可）。</div>'+
+    '<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:13px">'+
+    rows.map(function(r){
+      return '<tr style="border-top:1px solid var(--border)"><td style="padding:6px 8px;white-space:nowrap"><strong>'+esc(r[0])+'</strong></td>'+
+        '<td style="padding:6px 8px;color:var(--text3)">'+esc(r[1])+'</td>'+
+        '<td style="padding:6px 8px"><code style="word-break:break-all">'+esc(r[2])+'</code></td>'+
+        '<td style="padding:6px 8px"><button class="btn btn-ghost btn-sm" onclick="copyText('+esc(JSON.stringify(r[2]))+')">复制</button></td></tr>';
+    }).join('')+
+    '</table>'+
     '</div>';
 }
 

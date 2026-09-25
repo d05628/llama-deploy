@@ -141,6 +141,20 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual(tool["tool_call_id"], "c1")
 
 
+class InvalidToolCallTests(unittest.TestCase):
+    def test_unfixable_call_goes_back_to_the_client_instead_of_ending_the_turn(self):
+        # 此前改写成说明文字：Claude Code 把它当成回答完毕，渲染报错后没机会修脚本就收工了
+        resp = {"choices": [{"finish_reason": "tool_calls", "message": {"content": "fixing the camera", "tool_calls": [
+            {"id": "c1", "function": {"name": "Edit", "arguments": json.dumps({"old_string": "a", "new_string": "b"})}}]}}]}
+        schema = {"Edit": {"type": "object", "required": ["file_path", "old_string", "new_string"],
+                           "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"},
+                                          "new_string": {"type": "string"}}}}
+        msg = compat.openai_to_anthropic(resp, {}, "m", schema)
+        self.assertEqual(msg["stop_reason"], "tool_use")
+        self.assertEqual([b["type"] for b in msg["content"]], ["text", "tool_use"])
+        self.assertEqual(msg["content"][1]["name"], "Edit")
+
+
 class HeartbeatTests(unittest.TestCase):
     def test_slow_upstream_sends_heartbeats_and_returns_result(self):
         # 长回复要生成 2-3 分钟，期间不发任何字节客户端就会断开重试（实测 Claude Code 无限重发）

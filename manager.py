@@ -41,6 +41,7 @@ import time
 import unicodedata
 
 import agents
+import engines
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -123,6 +124,7 @@ def default_config():
             "mmproj_map": {},
             "mmproj_bindings": {},
         },
+        "engine": {"provider": "auto", "directory": ""},
         "download": {
             "hf_mirror": "https://hf-mirror.com",
             "github_mirror": "",
@@ -390,7 +392,7 @@ QUANT_TYPES = (
     "IQ3_XXS", "IQ3_XS", "IQ3_M", "IQ3_S",
     "IQ2_XXS", "IQ2_XS", "IQ2_M", "IQ2_S",
     "IQ1_M", "IQ1_S",
-    "TQ2_0", "TQ1_0",
+    "TQ2_0", "TQ1_0", "PQ2_0", "PTQ1_0",
 )
 
 _QUANT_BY_LENGTH = tuple(sorted(QUANT_TYPES, key=len, reverse=True))
@@ -1948,6 +1950,7 @@ class ModelLibrary:
                 "quant": quant,
                 "is_mmproj": is_mmproj,
                 "is_active": False,  # 下面会标记
+                "required_engine": "prism" if engines.prism_quant(f) else "upstream",
             })
 
         # 标记当前激活的模型
@@ -2032,6 +2035,8 @@ class ModelLibrary:
 
             save_config(cfg)
             msg = f"✅ 已切换为: {filename}"
+            if engines.prism_quant(filename):
+                msg += "\n此量化需要 Prism 专用引擎，请先运行 python deploy.py --install-prism"
             if matched:
                 msg += f"\n👁️ 自动匹配视觉模块: {matched}"
             else:
@@ -3464,7 +3469,8 @@ async function refreshLibrary(){
   mainModels.forEach(function(m){
     html+='<tr><td><div style="font-weight:500">'+esc(m.filename)+'</div>'+
       '<div style="font-size:11px;color:var(--text3)">'+esc(m.path)+'</div></td>'+
-      '<td><span class="tag tag-blue">'+esc(m.quant)+'</span></td>'+
+      '<td><span class="tag tag-blue">'+esc(m.quant)+'</span>'+
+      (m.required_engine==='prism'?'<br><span class="tag tag-yellow">需 Prism 引擎</span>':'')+'</td>'+
       '<td>'+(m.size_mb>1024?m.size_gb+' GB':m.size_mb+' MB')+'</td>'+
       '<td>'+(m.is_active?'<span class="tag tag-green">🟢 使用中</span>':'<span class="tag tag-yellow">待命</span>')+'</td>'+
       '<td style="white-space:nowrap">'+(m.is_active?'<span style="font-size:12px;color:var(--text3)">当前模型</span>':

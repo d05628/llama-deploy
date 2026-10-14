@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import engines
 
 if sys.platform == "win32":
     try:
@@ -1156,23 +1157,28 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
         pc = {**pc, **AGENT_OVERRIDES}
         sc = {**sc, "ctx_size": 0}
 
-    binary = find_binary("llama-cli" if mode == "chat" else "llama-server")
-    if not binary.exists():
-        raise RuntimeError(f"找不到可执行文件: {binary}\n请先运行 python deploy.py 完成部署")
-
     model = resolve_model(MODELS_DIR / mc.get("model_file", ""), mc)
     if not model:
         raise RuntimeError(
             f"模型文件不存在: {MODELS_DIR / mc.get('model_file', '')}\n"
             "请检查 config.jsonc 中 model.model_file 是否与 models/ 目录下的文件名一致"
         )
+    provider = engines.provider_for(cfg, model)
+    gpu = accel(gc.get("backend", "auto"))
+    if provider == "prism" and gc.get("backend", "auto") not in ("auto", gpu["selected_backend"]):
+        raise RuntimeError("unsupported: 请求的 Prism GPU 后端不可用；不会自动回退 CPU")
+    name = "llama-cli" if mode == "chat" else "llama-server"
+    binary = (engines.select_prism_binary(BASE_DIR, cfg, model, name,
+                                         gpu["selected_backend"], IS_WIN)
+              if provider == "prism" else find_binary(name))
+    if not binary.exists():
+        raise RuntimeError(f"找不到可执行文件: {binary}\n请先运行 python deploy.py 完成部署")
     configured_mmproj = (
         MODELS_DIR / "vision" / mc.get("mmproj_file", "")
         if mc.get("mmproj_file", "")
         else None
     )
     meta = gguf_meta(model)
-    gpu  = accel(gc.get("backend", "auto"))
     warn = []
     mmproj = configured_mmproj
 
@@ -1212,6 +1218,19 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     #   always_on    — 模型强制思考，无法关闭（如部分 MiniMax 版本）
     #   none         — 非思考型模型
     thinking_mode = detect_thinking_mode(model, meta)
+
+    if provider == "prism" and engines.prism_quant(model):
+        # --reasoning controls extraction; Bonsai's Jinja template separately
+        # defaults enable_thinking to true and reasoning_effort to xhigh.
+        if not supports(binary, "--chat-template-kwargs"):
+            raise RuntimeError("Prism 引擎缺少 --chat-template-kwargs，无法可靠应用 Bonsai 思考配置")
+        kwargs = {"enable_thinking": wants_thinking}
+        if wants_thinking:
+            effort = str(sc.get("reasoning_effort", "xhigh")).lower()
+            if effort not in ("medium", "xhigh"):
+                raise RuntimeError("Bonsai reasoning_effort 支持 medium/xhigh；作者说明 low 不生效")
+            kwargs["reasoning_effort"] = effort
+        args += ["--chat-template-kwargs", json.dumps(kwargs, separators=(",", ":"))]
 
     if supports(binary, "--reasoning"):
         if thinking_mode == "controllable":
@@ -1774,12 +1793,17 @@ def cmd_benchmark(cfg: dict, sweep=False) -> int:
     model = resolve_model(MODELS_DIR / mc.get("model_file", ""), mc)
     if not model:
         raise RuntimeError("未找到当前模型，请先在管理器中选择或下载模型")
-    binary = find_binary("llama-bench")
+    provider = engines.provider_for(cfg, model)
+    gpu = accel(gc.get("backend", "auto"))
+    if provider == "prism" and gc.get("backend", "auto") not in ("auto", gpu["selected_backend"]):
+        raise RuntimeError("unsupported: 请求的 Prism GPU 后端不可用；不会自动回退 CPU")
+    binary = (engines.select_prism_binary(BASE_DIR, cfg, model, "llama-bench",
+                                         gpu["selected_backend"], IS_WIN)
+              if provider == "prism" else find_binary("llama-bench"))
     if not binary.exists():
         raise RuntimeError("当前 llama.cpp 包缺少 llama-bench，请先运行 python deploy.py --upgrade-llama")
 
     meta = gguf_meta(model)
-    gpu = accel(gc.get("backend", "auto"))
     tuning = performance_tuning(
         model, meta, gpu, pc, _safe_int(sc.get("ctx_size"), 8192), False, 0.0
     )

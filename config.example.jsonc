@@ -8,6 +8,12 @@
     "mmproj_map": {},
     "mmproj_bindings": {}
   },
+  "engine": {
+    // auto 按 GGUF 类型选择：PQ2_0/PTQ1_0 使用独立 Prism fork。
+    "provider": "auto",
+    // 可选：指定已登记的引擎版本目录，回退时改回旧目录即可。
+    "directory": ""
+  },
   "download": {
     "hf_mirror": "https://hf-mirror.com",
     // 可选；留空时使用 GitHub 官方直链，镜像失败也会自动回退直链。

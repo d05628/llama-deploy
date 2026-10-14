@@ -48,6 +48,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import engines
 
 # ============================================================
 #  常量定义
@@ -823,6 +824,8 @@ class Deployer:
 
         # 路径
         self.model_path = MODELS_DIR / self.model_file
+        self.engine_provider = engines.provider_for(self.config, self.model_path)
+        self.prism_engine_dir = None
         self.mmproj_dir = MODELS_DIR / "vision"
         self.mmproj_path = self.mmproj_dir / self.mmproj_file
 
@@ -958,6 +961,9 @@ class Deployer:
         搜索顺序：根目录 → build/bin → bin → build/Release/bin
         """
         is_win = self.sys.is_windows
+        if getattr(self, "engine_provider", "upstream") == "prism":
+            root = getattr(self, "prism_engine_dir", None)
+            return engines.prism_binary(root, stem, is_win) if root else None
         # 候选文件名（按优先级）
         if is_win:
             names = [f"{stem}.exe", f"{stem.split('-')[-1]}.exe"]
@@ -998,6 +1004,21 @@ class Deployer:
 
     # ----- 下载 llama.cpp -----
     def _download_llama(self):
+        if getattr(self, "engine_provider", "upstream") == "prism":
+            if self.force_source:
+                raise RuntimeError("Prism 源码构建请使用作者说明；不会回退到 stock llama.cpp。")
+            configured = str(self.config.get("engine", {}).get("directory", "") or "")
+            if configured:
+                # Validate both executables before accepting a pinned/older engine.
+                for name in ("llama-server", "llama-cli"):
+                    engines.select_prism_binary(BASE_DIR, self.config, self.model_path,
+                                                name, self.actual_backend, self.sys.is_windows)
+                root = Path(configured)
+                self.prism_engine_dir = root if root.is_absolute() else BASE_DIR / root
+            else:
+                self.prism_engine_dir = install_prism(self.config, self.actual_backend)
+            self._relocate_bins()
+            return
         if self.upgrade_llama and LLAMA_DIR.exists():
             running = running_llama_processes()
             if running:
@@ -1606,6 +1627,9 @@ class Deployer:
 
     # ----- 编译 llama.cpp -----
     def _build_llama(self):
+        if getattr(self, "engine_provider", "upstream") == "prism":
+            self.p("build_skip")
+            return
         if self.sys.is_windows:
             if self.server_bin.exists():
                 self.p("build_skip")
@@ -2226,8 +2250,186 @@ class Deployer:
 #  入口
 # ============================================================
 
+def install_prism(config: dict, backend: str = None, cuda_version: str = None) -> Path:
+    """Install an author release independently; never run or replace an engine."""
+    system = SystemInfo()
+    if not system.is_windows:
+        raise RuntimeError("Prism 自动安装目前支持 Windows；其它平台请按作者 Bonsai-demo 说明安装。")
+    gpu = GPUDetector.detect()
+    backend = backend or config.get("gpu", {}).get("backend", "auto")
+    if backend == "auto":
+        backend = gpu.get("recommended_backend", "cpu")
+    if backend not in ("cuda", "cpu", "vulkan"):
+        raise RuntimeError(f"unsupported: Prism Windows backend={backend}")
+    cuda_version = cuda_version or config.get("engine", {}).get("cuda_version", "12.4")
+    helper = object.__new__(Deployer)
+    helper.sys, helper.gpu_info, helper.actual_backend = system, gpu, backend
+    helper.dl = Downloader(config, Printer(config.get("ui", {}).get("language", "zh")))
+    release = helper._fetch_github_json(
+        f"https://api.github.com/repos/{engines.PRISM_REPO}/releases/tags/{engines.PRISM_TAG}"
+    )
+    if release.get("tag_name") != engines.PRISM_TAG or release.get("draft"):
+        raise RuntimeError("Prism release 身份不匹配，已取消安装")
+    assets = release.get("assets", [])
+    if backend == "cuda":
+        if not re.fullmatch(r"\d+\.\d+", str(cuda_version)):
+            raise RuntimeError("engine.cuda_version 必须是 CUDA 版本号，例如 12.4")
+        assets = [a for a in assets if f"-cuda-{cuda_version}-" in a.get("name", "")]
+    main, runtime = helper._find_best_asset(assets)
+    if not main or (backend == "cuda" and not runtime):
+        raise RuntimeError(f"unsupported: 作者 release 缺少匹配的 Prism {backend} {cuda_version} 完整包；不会回退。")
+    for asset in [main] + ([runtime] if runtime else []):
+        expected_url = f"https://github.com/{engines.PRISM_REPO}/releases/download/{engines.PRISM_TAG}/"
+        if (not str(asset.get("browser_download_url", "")).startswith(expected_url)
+                or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", str(asset.get("digest", "")))):
+            raise RuntimeError("Prism 资产缺少作者 SHA256 或下载地址不匹配，已取消安装")
+    parent = BASE_DIR / "engines" / "prism" / engines.PRISM_TAG
+    parent.mkdir(parents=True, exist_ok=True)
+    destination = parent / Path(main["name"]).stem
+    if destination.exists():
+        info = engines.engine_info(destination)
+        if (info.get("provider") == "prism" and info.get("backend") == backend
+                and info.get("asset_digest") == main["digest"]
+                and info.get("runtime_digest", "") == (runtime or {}).get("digest", "")
+                and engines.prism_binary(destination, "llama-server")
+                and engines.prism_binary(destination, "llama-cli")
+                and info.get("binary_sha256") == engines.file_sha256(
+                    engines.prism_binary(destination, "llama-server"))):
+            engines.verify_prism_integrity(destination, info)
+            print(f"Prism 引擎已存在: {destination}")
+            return destination
+        raise RuntimeError(f"独立目标目录已存在但登记信息不完整，未覆盖: {destination}")
+    downloader = helper.dl
+    with tempfile.TemporaryDirectory(prefix=".install-", dir=parent) as temporary:
+        temporary = Path(temporary)
+        stage = temporary / "engine"
+        stage.mkdir()
+        for index, asset in enumerate([main] + ([runtime] if runtime else [])):
+            archive_path = temporary / f"asset-{index}.zip"
+            print(f"下载 Prism 作者包: {asset['name']}")
+            if not downloader.download_from_urls(
+                downloader.github_urls(asset["browser_download_url"]), archive_path,
+                int(asset.get("size") or 0),
+                lambda path, asset=asset: helper._validate_release_asset(path, asset),
+            ):
+                raise RuntimeError("Prism 包下载或 SHA256 校验失败；当前引擎保持原位")
+            helper._extract_zip_flat(archive_path, stage)
+        required = ["llama-server.exe", "llama-cli.exe", "llama.dll", "ggml.dll"]
+        if backend == "cuda":
+            required += ["ggml-cuda.dll"]
+            if not list(stage.glob("cudart*.dll")) or not list(stage.glob("cublas*.dll")):
+                raise RuntimeError("Prism CUDA runtime DLL 不完整，未发布引擎")
+        missing = [name for name in required if not (stage / name).is_file() or (stage / name).stat().st_size < 1024]
+        if missing:
+            raise RuntimeError("Prism 包不完整，未发布引擎: " + ", ".join(missing))
+        write_engine_info({
+            "provider": "prism", "engine": "prism", "repository": engines.PRISM_REPO,
+            "commit": engines.PRISM_TAG.rsplit("-", 1)[-1],
+            "binary_sha256": engines.file_sha256(stage / "llama-server.exe"),
+            "runtime_files_sha256": engines.runtime_file_hashes(stage),
+            "executable_files_sha256": engines.executable_file_hashes(stage),
+            "tag": engines.PRISM_TAG, "backend": backend,
+            "quant_types": ["PQ2_0", "PTQ1_0"], "asset": main["name"],
+            "asset_digest": main["digest"], "runtime": (runtime or {}).get("name", ""),
+            "runtime_digest": (runtime or {}).get("digest", ""),
+            "installed_at": datetime.now().isoformat(timespec="seconds"),
+        }, stage)
+        if not (stage / ENGINE_INFO_NAME).is_file():
+            raise RuntimeError("无法登记 Prism 引擎，未发布")
+        engines.verify_prism_integrity(stage)
+        stage.rename(destination)
+    print(f"Prism 引擎已安装（尚未加载模型验证）: {destination}")
+    return destination
+
+
+def register_prism_manifest(root: Path, config: dict = None) -> Path:
+    """Complete a just-installed verified author's manifest without downloading.
+
+    This records current files, so it is only for a freshly verified installation,
+    never a repair path for an integrity failure or an untrusted DLL directory.
+    """
+    root = Path(root).resolve()
+    allowed = (BASE_DIR / "engines" / "prism" / engines.PRISM_TAG).resolve()
+    if root.parent != allowed:
+        raise RuntimeError("只可补全独立 pinned Prism 安装目录的 manifest")
+    info = engines.engine_info(root)
+    if (info.get("provider") != "prism" or info.get("repository") != engines.PRISM_REPO
+            or info.get("tag") != engines.PRISM_TAG or info.get("backend") not in ("cuda", "cpu", "vulkan")):
+        raise RuntimeError("现有 manifest 来源不匹配，拒绝登记")
+    # Full manifests are immutable baselines. Legacy registration verifies every
+    # existing hash before adding the missing inventory from this trusted install.
+    if "runtime_files_sha256" in info and "executable_files_sha256" in info:
+        engines.verify_prism_integrity(root, info)
+        return root / ENGINE_INFO_NAME
+    engines.verify_prism_integrity(root, info, allow_legacy=True)
+    helper = object.__new__(Deployer)
+    helper.dl = Downloader(config or {}, Printer())
+    release = helper._fetch_github_json(
+        f"https://api.github.com/repos/{engines.PRISM_REPO}/releases/tags/{engines.PRISM_TAG}"
+    )
+    if release.get("tag_name") != engines.PRISM_TAG:
+        raise RuntimeError("作者 release 身份不匹配，拒绝登记")
+    assets = {asset.get("name"): asset for asset in release.get("assets", [])}
+    pairs = [("asset", "asset_digest")]
+    if info["backend"] == "cuda":
+        pairs.append(("runtime", "runtime_digest"))
+    for name_key, digest_key in pairs:
+        expected = assets.get(info.get(name_key), {}).get("digest", "")
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", str(expected)) or info.get(digest_key) != expected:
+            raise RuntimeError("现有 archive SHA256 与作者登记不匹配，拒绝登记")
+    binary = engines.prism_binary(root, "llama-server")
+    if not binary or not engines.prism_binary(root, "llama-cli"):
+        raise RuntimeError("Prism 可执行文件缺失，拒绝登记")
+    binary_hash = engines.file_sha256(binary)
+    if info.get("binary_sha256") and info["binary_sha256"] != binary_hash:
+        raise RuntimeError("Prism binary SHA256 已变化，拒绝重新登记")
+    hashes = engines.runtime_file_hashes(root)
+    required = {"llama.dll", "ggml.dll"}
+    if info["backend"] == "cuda":
+        required.add("ggml-cuda.dll")
+        if not any(name.startswith("cudart") for name in hashes) or not any(name.startswith("cublas") for name in hashes):
+            raise RuntimeError("Prism CUDA DLL 不完整，拒绝登记")
+    if not required.issubset(hashes):
+        raise RuntimeError("Prism DLL 不完整，拒绝登记")
+    # Never replace an existing expected inventory, even if files changed while
+    # fetching release metadata. Final verification must use the original hashes.
+    info.setdefault("runtime_files_sha256", hashes)
+    info.setdefault("executable_files_sha256", engines.executable_file_hashes(root))
+    info.update(engine="prism", commit=engines.PRISM_TAG.rsplit("-", 1)[-1],
+                binary_sha256=binary_hash)
+    engines.verify_prism_integrity(root, info)
+    manifest = root / ENGINE_INFO_NAME
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                                         prefix=".manifest-", suffix=".json", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(info, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, manifest)
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+    print(f"Prism EXE/DLL 完整性登记已补全: {manifest}")
+    return manifest
+
+
 if __name__ == "__main__":
     try:
+        if "--register-prism-manifest" in sys.argv:
+            index = sys.argv.index("--register-prism-manifest")
+            if index + 1 >= len(sys.argv):
+                raise RuntimeError("--register-prism-manifest 后需要刚完成验证的安装目录")
+            register_prism_manifest(Path(sys.argv[index + 1]), parse_jsonc(CONFIG_FILE))
+            sys.exit(0)
+        if "--install-prism" in sys.argv:
+            cuda_version = None
+            if "--prism-cuda" in sys.argv:
+                index = sys.argv.index("--prism-cuda")
+                if index + 1 >= len(sys.argv):
+                    raise RuntimeError("--prism-cuda 后需要版本号，例如 12.4")
+                cuda_version = sys.argv[index + 1]
+            install_prism(parse_jsonc(CONFIG_FILE), cuda_version=cuda_version)
+            sys.exit(0)
         if "--rollback-llama" in sys.argv:
             sys.exit(rollback_llama())
         force_source = "--build-from-source" in sys.argv

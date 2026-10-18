@@ -42,6 +42,7 @@ import unicodedata
 
 import agents
 import engines
+import multi_gpu
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -153,6 +154,11 @@ def default_config():
             "backend": "auto",
             "gpu_layers": -1,
             "flash_attention": True,
+            "multi_gpu": "auto",
+            "main_gpu": "auto",
+            "split_mode": "layer",
+            "tensor_split": "",
+            "reserve_mb": 1024,
         },
         "sampling": {
             "temperature": 0.7,
@@ -579,28 +585,29 @@ def get_system_info() -> dict:
     gpu_vram_mb = 0
     gpu_vram_free_mb = 0
     gpu_backend = "cpu"
+    gpus = []
     # ── NVIDIA GPU 检测 ───────────────────────────────────────────────────────
     # nvidia-smi 格式：name, memory.total, memory.free
     # GPU 名字可能含逗号，从右侧取两个数字字段更安全
     try:
         result = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=name,memory.total,memory.free",
+             "--query-gpu=index,uuid,name,memory.total,memory.free,compute_cap",
              "--format=csv,noheader,nounits"],
             capture_output=True, timeout=5,
             encoding="utf-8", errors="replace",
         )
-        if result.returncode == 0 and result.stdout.strip():
-            first_line = result.stdout.strip().splitlines()[0]
-            parts = [x.strip() for x in first_line.rsplit(",", 2)]
-            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
-                gpu_name       = parts[0]
-                gpu_vram_mb    = int(parts[1])
-                gpu_vram_free_mb = int(parts[2])
-                gpu_backend    = "cuda"
-            elif len(parts) >= 2 and parts[-1].isdigit():
-                gpu_name    = parts[0]
-                gpu_vram_mb = int(parts[-1])
+        if result.returncode != 0:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, timeout=5, encoding="utf-8", errors="replace")
+        if result.returncode == 0:
+            gpus = multi_gpu.parse_nvidia_inventory(result.stdout)
+            primary = multi_gpu.choose_primary(gpus)
+            if primary:
+                gpu_name = primary["name"]
+                gpu_vram_mb = primary["vram_mb"]
+                gpu_vram_free_mb = primary["vram_free_mb"]
                 gpu_backend = "cuda"
     except FileNotFoundError:
         pass   # nvidia-smi 未安装
@@ -638,6 +645,8 @@ def get_system_info() -> dict:
         "gpu_vram_mb": gpu_vram_mb,
         "gpu_vram_free_mb": gpu_vram_free_mb,
         "gpu_backend": gpu_backend,
+        "gpus": gpus,
+        "gpu_count": len(gpus),
     }
 
 
@@ -1390,7 +1399,8 @@ def gpu_weight_budget_gb(vram_mb: int, vram_free_mb: int = 0) -> float:
     return max(0.0, round(usable_gb - reserve, 1))
 
 
-def get_recommendations(ram_gb: float, vram_mb: int = 0, vram_free_mb: int = 0) -> dict:
+def get_recommendations(ram_gb: float, vram_mb: int = 0, vram_free_mb: int = 0,
+                        gpus=None, cfg=None, server_running=False) -> dict:
     usable = ram_gb * 0.65
     max_model_gb = usable - 0.3
     recs = {
@@ -1419,6 +1429,73 @@ def get_recommendations(ram_gb: float, vram_mb: int = 0, vram_free_mb: int = 0) 
         recs["tips"].extend(["建议 0.5-1B 参数模型", "关闭思考模式节省内存"])
     elif ram_gb <= 8:
         recs["tips"].append("内存可支撑 1-3B 参数模型")
+    if gpus is not None and len(gpus) > 1:
+        # Aggregate VRAM is not a contiguous allocation. Check every card and
+        # model KV metadata before describing a particular context as fitting.
+        import run
+        cfg = cfg or {}
+        gc, pc, sc = cfg.get("gpu", {}), cfg.get("performance", {}), cfg.get("server", {})
+        recs["tips"] = [tip for tip in recs["tips"] if "GPU" not in tip and "显存" not in tip and "量化" not in tip]
+        try:
+            primary = multi_gpu.choose_primary(gpus, gc.get("main_gpu", "auto"))
+            model_file = cfg.get("model", {}).get("model_file", "")
+            model = run.resolve_model(MODELS_DIR / model_file, cfg.get("model", {})) if model_file else None
+            meta = run.gguf_meta(model) if model else {}
+            plan_devices = gpus
+            if gc.get("tensor_split") or (gc.get("split_mode", "layer") == "row" and gc.get("multi_gpu", "auto") != "off"):
+                # Custom ratios and row-mode global device indices both need
+                # the complete actual engine enumeration.
+                if not model:
+                    raise ValueError("自定义分配比例或 row 模式需要先选择已下载的模型，才能验证对应引擎的设备顺序")
+                provider = engines.provider_for(cfg, model)
+                binary = (engines.select_prism_binary(BASE_DIR, cfg, model, "llama-server", "cuda", run.IS_WIN)
+                          if provider == "prism" else run.find_binary("llama-server"))
+                if not run.supports(binary, "--list-devices"):
+                    raise ValueError("自定义分配比例或 row 模式需要支持 --list-devices 的引擎，请先安装或升级")
+                result = run.rc([str(binary), "--list-devices"], 10)
+                plan_devices = multi_gpu.match_engine_devices(gpus, multi_gpu.parse_engine_devices(
+                    (result.stdout or "") + "\n" + (result.stderr or "")))
+                if result.returncode != 0 or not plan_devices:
+                    raise ValueError("当前引擎未列出可见 CUDA 设备，无法验证分配比例和 row 设备顺序")
+                primary = multi_gpu.choose_primary(plan_devices, gc.get("main_gpu", "auto"))
+            primary_gpu = {**primary, "selected_backend": "cuda"}
+            ctx = run._safe_int(sc.get("ctx_size", 0), 0)
+            tuning = run.performance_tuning(model, meta, primary_gpu, pc, ctx) if model else None
+            weights = tuning["gpu_weight_mb"] if tuning else 0.0
+            cache_k, cache_v = (tuning["cache_type_k"], tuning["cache_type_v"]) if tuning else ("q8_0", "q8_0")
+            kv_per_token = run.kv_cache_mb(meta, 1024, cache_k, cache_v) / 1024
+            floor_ctx = tuning["min_ctx"] if tuning else run._safe_int_min(pc.get("min_ctx_size", 8192), 8192, 512)
+            reserve = multi_gpu.configured_reserve(gc, tuning["fit_target_mb"] if tuning else 0)
+            target_kv = kv_per_token * (ctx if ctx > 0 else floor_ctx)
+            plan = multi_gpu.build_plan(plan_devices, gc, weights, target_kv, reserve_mb=reserve)
+            single = multi_gpu.build_plan(plan_devices, {**gc, "multi_gpu": "off"}, reserve_mb=reserve)
+            recs["single_gpu_max_model_gb"] = round(single["payload_capacity_mb"] / 1024, 1)
+            recs["gpu_max_model_gb"] = round(max(0, plan["payload_capacity_mb"] - target_kv) / 1024, 1)
+            if gc.get("multi_gpu", "auto") != "off":
+                try:
+                    combined = multi_gpu.build_plan(plan_devices, {**gc, "multi_gpu": "force", "tensor_split": ""}, reserve_mb=reserve)
+                    recs["multi_gpu_max_model_gb"] = round(combined["payload_capacity_mb"] / 1024, 1)
+                except ValueError:
+                    pass
+            advised = multi_gpu.context_limit(plan, weights, kv_per_token, meta.get("context_length", 0))
+            if advised is not None:
+                recs["recommended_ctx"] = advised
+                recs["context_basis"] = "model_metadata_per_device"
+                recs["tips"].append(f"按所选模型的 KV 元数据逐卡估算，上下文上限约 {advised}；启动日志 n_ctx 和实测分配为准")
+            else:
+                recs["context_basis"] = "generic"
+                recs["tips"].append("尚无完整的所选模型 KV 元数据，上下文建议仅作参考；ctx_size=0 交给引擎实际拟合")
+            recs["gpu_plan"] = plan
+            recs["capacity_basis"] = "current_free"
+            recs["tips"].extend(plan["notes"])
+            recs["tips"].append("当前计划权重预算已扣除所选模型目标上下文的 KV（元数据完整时）；单卡/多卡候选容量未计具体模型 KV，不能直接相加标称显存")
+            if gc.get("backend", "auto") not in ("auto", "cuda") or run._safe_int(gc.get("gpu_layers", -1), -1) == 0:
+                recs["tips"].append("当前配置未启用 CUDA GPU 卸载，上述 CUDA 容量仅供硬件参考")
+            if server_running:
+                recs["tips"].append("当前模型服务正在占用显存；以上是实时剩余容量，停止服务后可重新估算")
+        except (ValueError, TypeError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            recs["gpu_plan"] = {"error": str(exc), "notes": [str(exc)]}
+            recs["tips"].append(str(exc))
     return recs
 
 
@@ -2139,14 +2216,11 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self._json_resp({"files": [], "repo_id": repo_id, "error": str(e)})
         elif path == "/api/recommend":
-            ram = float(params.get("ram", "4"))
-            vram = int(params.get("vram", "0"))
-            vram_free = int(params.get("vram_free", "0"))
-            if deploy_mgr.get_server_status().get("server_running"):
-                # 模型服务自己占着显存：此时的"空闲显存"接近 0，会得出"权重 ≤0.0GB 可驻留"的荒谬建议。
-                # 改按整卡容量估算（gpu_weight_budget_gb 在 free 为 0 时按总显存的 92% 计）
-                vram_free = 0
-            self._json_resp(get_recommendations(ram, vram, vram_free))
+            info = get_system_info()
+            cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
+            self._json_resp(get_recommendations(
+                info["ram_gb"], info["gpu_vram_mb"], info["gpu_vram_free_mb"],
+                info["gpus"], cfg, deploy_mgr.get_server_status().get("server_running", False)))
 
         elif path == "/api/models":
             self._json_resp({"models": model_lib.scan()})
@@ -2689,6 +2763,42 @@ a{color:var(--primary);text-decoration:none}
             <div class="form-hint" id="gpuLayersHint">自动模式：系统会根据模型大小和可用显存计算最佳层数，大模型自动部分卸载</div>
           </div>
         </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="cfg-multi_gpu">多 GPU 策略（CUDA）</label>
+            <select class="form-input" id="cfg-multi_gpu">
+              <option value="auto">auto — 按模型大小自动选择（推荐）</option>
+              <option value="off">off — 只使用主 GPU</option>
+              <option value="force">force — 使用多张 GPU</option>
+            </select>
+            <div class="form-hint">auto：模型及目标上下文预计能放入所选主卡时使用单卡，需要更多显存时再分配到多卡。force 需要至少两张可用 CUDA 显卡。</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="cfg-main_gpu">主 GPU</label>
+            <select class="form-input" id="cfg-main_gpu"><option value="auto">auto — 按可用显存选择</option></select>
+            <div class="form-hint">编号来自 NVIDIA 设备列表；配置文件也支持 GPU UUID。显示器、TTS、VRM 等程序占用的显存会影响计划。</div>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="cfg-split_mode">多卡拆分方式</label>
+            <select class="form-input" id="cfg-split_mode">
+              <option value="layer">layer — 按层拆分（推荐）</option>
+              <option value="row">row — 按行拆分</option>
+            </select>
+            <div class="form-hint">layer 通常适合作为起点；row 的表现取决于设备互联和模型，需实测速度。</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="cfg-tensor_split">自定义显存分配权重</label>
+            <input class="form-input" id="cfg-tensor_split" placeholder="留空自动，例如 2,1">
+            <div class="form-hint">按引擎设备顺序填入逗号分隔的非负数，至少一个大于 0，每张候选显卡一个值。2,1 表示约 2:1；不表示 GiB，也不合并物理显存。</div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="cfg-gpu_reserve_mb">每张 GPU 额外预留显存（MiB）</label>
+          <input class="form-input" id="cfg-gpu_reserve_mb" type="number" min="0" step="1" value="1024">
+          <div class="form-hint">多卡规划默认每卡额外预留 1024 MiB。与 TTS、VRM 等共用 GPU 时可提高；规划依据当前可用显存，后续其他程序仍可能继续占用。</div>
+        </div>
         <div class="form-group">
           <label class="form-label" for="cfg-flash_attn">Flash Attention</label>
           <div class="form-toggle" onclick="toggleSwitch('cfg-flash_attn')">
@@ -2697,6 +2807,7 @@ a{color:var(--primary);text-decoration:none}
           </div>
         </div>
         <div id="gpuDetectInfo" style="margin-top:8px;padding:10px;background:var(--bg3);border-radius:6px;font-size:13px"></div>
+        <div id="gpuPlanInfo" style="margin-top:8px;padding:10px;background:var(--bg3);border-radius:6px;font-size:13px" aria-live="polite"></div>
         <div id="gpuGuide" style="margin-top:8px;padding:10px;background:var(--bg3);border-radius:6px;font-size:12px;color:var(--text3);display:none"></div>
       </div>
       <div class="card">
@@ -2986,14 +3097,10 @@ function copyText(txt){navigator.clipboard.writeText(txt).then(function(){showTo
 
 async function init(){
   sysInfo=await api('/api/system');
-  document.getElementById('sidebarInfo').innerHTML=
-    '<div>💻 '+sysInfo.os+' '+sysInfo.arch+'</div>'+
-    '<div>🧠 内存: '+sysInfo.ram_gb+'GB</div>'+
-    '<div>💾 磁盘: '+sysInfo.disk_free_gb+'GB 可用</div>'+
-    '<div>⚡ CPU: '+sysInfo.cpu_count+' 核</div>'+
-    (sysInfo.gpu_name?'<div>🎮 '+sysInfo.gpu_name+'</div><div>   显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB</div>':'<div>🎮 无独显</div>');
+  renderHardwareSummary();
   await loadDefaultCfg();
-  loadConfig();pollStatus();updateSystemPage();loadEngineInfo();loadAgents();
+  await loadConfig();
+  pollStatus();loadEngineInfo();loadAgents();
   // 支持 #deploy 这类地址直接打开对应页面（可收藏）
   var hashPage=location.hash.replace('#','');
   if(hashPage&&document.getElementById('page-'+hashPage)){
@@ -3002,48 +3109,104 @@ async function init(){
     switchPage(hashPage,navEl);
   }
   document.addEventListener('change',function(e){if(e.target&&e.target.id&&e.target.id.indexOf('cfg-')===0)renderPresets()});
-  var vram=sysInfo.gpu_vram_mb||0;
-  var rec=await api('/api/recommend?ram='+sysInfo.ram_gb+'&vram='+vram+'&vram_free='+(sysInfo.gpu_vram_free_mb||0));
+  await refreshDeviceRecommendations(false);
+}
+
+function gpuInventoryHtml(info){
+  var gpus=info.gpus||[];
+  if(!gpus.length){
+    return info.gpu_name?'<strong>'+esc(info.gpu_name)+'</strong> · 显存: '+((info.gpu_vram_mb||0)/1024).toFixed(1)+' GiB':
+      '<span class="tag tag-yellow">未检测到 GPU</span>';
+  }
+  return gpus.map(function(g){
+    return '<div style="margin:4px 0"><strong>GPU '+esc(g.index)+' · '+esc(g.name)+'</strong> · 总显存: '+
+      ((g.vram_mb||0)/1024).toFixed(1)+' GiB · 当前可用: '+
+      (g.free_known===false?'未知':((g.vram_free_mb||0)/1024).toFixed(1)+' GiB')+
+      (g.uuid?'<div class="form-hint" style="overflow-wrap:anywhere">'+esc(g.uuid)+'</div>':'')+'</div>';
+  }).join('');
+}
+
+function populateMainGpuOptions(value){
+  var sel=document.getElementById('cfg-main_gpu');if(!sel)return;
+  var selected=String(value==null?'auto':value),seen=selected==='auto';
+  var options='<option value="auto">auto — 按可用显存选择</option>';
+  (sysInfo.gpus||[]).forEach(function(g){
+    if(String(g.index)===selected)seen=true;
+    options+='<option value="'+esc(g.index)+'">GPU '+esc(g.index)+' · '+esc(g.name)+'</option>';
+  });
+  // 保留离线设备或按 UUID 保存的选择，避免打开页面后静默改成 auto。
+  if(!seen)options+='<option value="'+esc(selected)+'">已配置: '+esc(selected)+'</option>';
+  sel.innerHTML=options;sel.value=selected;
+}
+
+function gpuPlanHtml(rec){
+  var error=rec&&(rec.error||(rec.gpu_plan&&rec.gpu_plan.error));
+  if(error)return '<strong>GPU 计划暂不可用</strong><div class="form-hint">'+esc(error)+'</div>';
+  var plan=rec&&rec.gpu_plan;
+  if(!plan)return '<div class="form-hint">GPU 分配详情见模型启动日志；修改配置后请保存并重启模型服务。</div>';
+  var mode=plan.use_multi_gpu?'多 GPU':(plan.main_gpu==null?'未分配 CUDA GPU':'单 GPU');
+  var primary=plan.primary_index!=null?plan.primary_index:plan.main_gpu;
+  var split=Array.isArray(plan.tensor_split)?plan.tensor_split.join(', '):(plan.tensor_split||'');
+  var names=(plan.device_names||[]).map(esc).join(' + ');
+  return '<strong>当前配置计划：'+mode+'</strong>'+
+    (names?' · '+names:'')+
+    (primary!=null&&primary!==''?'<div>主 GPU: '+esc(primary)+'</div>':'')+
+    (plan.use_multi_gpu&&plan.split_mode?'<div>拆分方式: '+esc(plan.split_mode)+'</div>':'')+
+    (plan.use_multi_gpu&&split?'<div>分配权重: '+esc(split)+'</div>':'')+
+    (plan.notes||[]).map(function(n){return '<div class="form-hint">• '+esc(n)+'</div>'}).join('')+
+    '<div class="form-hint">依据已保存的配置和当前设备估算；实际显存、上下文和速度以模型启动及实测为准。修改后请保存，并重启模型服务。</div>';
+}
+
+function renderHardwareSummary(){
+  document.getElementById('sidebarInfo').innerHTML=
+    '<div>💻 '+esc(sysInfo.os)+' '+esc(sysInfo.arch)+'</div>'+
+    '<div>🧠 内存: '+sysInfo.ram_gb+'GB</div>'+
+    '<div>💾 磁盘: '+sysInfo.disk_free_gb+'GB 可用</div>'+
+    '<div>⚡ CPU: '+sysInfo.cpu_count+' 核</div>'+
+    ((sysInfo.gpus||[]).length?'<div>🎮 '+sysInfo.gpus.length+' 张 GPU</div>':
+      (sysInfo.gpu_name?'<div>🎮 '+esc(sysInfo.gpu_name)+'</div>':'<div>🎮 无独显</div>'));
+  var gpuEl=document.getElementById('gpuDetectInfo');
+  if(gpuEl)gpuEl.innerHTML=gpuInventoryHtml(sysInfo);
+}
+
+async function refreshDeviceRecommendations(refreshHardware){
+  if(refreshHardware){
+    var info=await api('/api/system');
+    if(info&&!info.error){sysInfo=info;renderHardwareSummary();populateMainGpuOptions(getVal('cfg-main_gpu'))}
+  }
+  // 由后端读取已保存的 GPU 策略和模型，避免旧单卡查询参数覆盖多卡预算。
+  var rec=await api('/api/recommend');
+  if(!rec||rec.error){
+    deviceRec=rec||{error:'无法读取 GPU 建议'};
+    var planEl=document.getElementById('gpuPlanInfo');
+    if(planEl)planEl.innerHTML=gpuPlanHtml(deviceRec);
+    var staleHint=document.getElementById('ramHint');if(staleHint)staleHint.style.display='none';
+    updateSystemPage();
+    return;
+  }
   deviceRec=rec;
   var hint=document.getElementById('ramHint');
   if(rec&&rec.tips){
     hint.style.display='block';
     hint.innerHTML='<div style="font-size:13px"><strong>💡 设备: '+sysInfo.ram_gb+'GB 内存'+
-      (sysInfo.gpu_name?' + '+sysInfo.gpu_name+' '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB':'')+
+      ((sysInfo.gpus||[]).length?' + '+sysInfo.gpus.length+' 张 GPU':(sysInfo.gpu_name?' + '+esc(sysInfo.gpu_name):''))+
       '</strong>'+
-      // 有 GPU 时，"该选哪个量化"取决于模型多大，给不出与模型无关的答案；
-      // 真正可执行的是显存预算，所以只在没有 GPU 时才显示笼统的推荐量化。
       (rec.gpu_max_model_gb
-        ?' · 权重预算: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+'GB 可完整驻留显存</span>'
-        :' · 推荐量化: <span class="tag tag-green">'+rec.recommended_quant+'</span>')+
-      ' · 推荐 ctx: <span class="tag tag-yellow">'+rec.recommended_ctx+'</span>'+
-      '<br><span style="color:var(--text3)">'+(rec.tips||[]).join(' · ')+'</span></div>';
+        ?' · 估算权重预算: <span class="tag tag-blue">约 '+rec.gpu_max_model_gb+' GiB</span>'
+        :' · 推荐量化: <span class="tag tag-green">'+esc(rec.recommended_quant)+'</span>')+
+      ' · 参考 ctx: <span class="tag tag-yellow">'+rec.recommended_ctx+'</span>'+
+      '<br><span style="color:var(--text3)">'+(rec.tips||[]).map(esc).join(' · ')+'</span></div>';
   }
-  var gpuEl=document.getElementById('gpuDetectInfo');
-  if(gpuEl){
-    gpuEl.innerHTML=sysInfo.gpu_name
-      ?'<span class="tag tag-green">✅ 检测到</span> <strong>'+sysInfo.gpu_name+'</strong> · 显存: '+(sysInfo.gpu_vram_mb/1024).toFixed(1)+'GB · 可用: '+(sysInfo.gpu_vram_free_mb/1024).toFixed(1)+'GB'
-      :'<span class="tag tag-yellow">⚠️ 未检测到独立显卡</span> 将使用 CPU 模式';
-  }
+  var planEl=document.getElementById('gpuPlanInfo');if(planEl)planEl.innerHTML=gpuPlanHtml(rec);
   var guideEl=document.getElementById('gpuGuide');
   if(guideEl&&sysInfo.gpu_name){
-    // 用 MB 判档：显卡实际上报值总是略低于标称（"16GB" 卡报 16311MiB＝15.9GB），
-    // 拿 15.9 去比 >=16 永远不成立，16GB 卡会被当成 8GB 档。
-    var vmb=sysInfo.gpu_vram_mb||0;
-    var vg=(vmb/1024).toFixed(1);
-    var bud=(deviceRec&&deviceRec.gpu_max_model_gb)||0;
     guideEl.style.display='block';
-    guideEl.innerHTML='<strong>💡 显存 '+vg+'GB 参考：</strong><br>'+
-      (bud?'• <strong>权重 ≤'+bud+'GB 的模型可完整驻留显存</strong>，这是速度的分水岭<br>':'')+
-      (vmb>=15000?'• 14B 以下模型可完整驻留；27B/32B 需选 ≤'+(bud||13.5)+'GB 的量化档位':
-       vmb>=11000?'• 8-14B 模型可完整驻留；更大的建议选更小的量化档位':
-       vmb>=7500?'• 7-8B 模型可完整驻留；14B 会有部分层落在 CPU':
-       vmb>=5500?'• 3-4B 模型可完整驻留；7-8B 会有部分层落在 CPU':
-       vmb>=3500?'• 1-2B 模型可完整驻留；3B+ 建议用自动模式':
-       '• 显存较小，建议使用自动模式')+
-      '<br>• 超出预算的部分会落到 CPU 内存上，带宽约为显存的 1/20，吐字速度成倍下降'+
-      '<br>• <strong>推荐使用「🤖 自动」模式</strong>，系统会智能计算最佳配置';
+    guideEl.innerHTML='<strong>💡 显存规划参考：</strong><br>'+
+      '• auto 优先使用所选主卡；模型放不下时才启用多卡。多卡不保证更快。<br>'+
+      '• 权重、KV cache、视觉投影与计算缓冲区都占显存；可用上下文还受模型结构影响。<br>'+
+      '• 与 TTS、VRM 共用设备时请提高每卡预留，并用实际工作负载验证。';
   }
+  updateSystemPage();
 }
 
 // 各源的提示文字
@@ -3221,20 +3384,25 @@ function renderFiles(files){
     var qTip = QUANT_TIP[f.quant]||f.quant;
     var sizeGb = f.size_gb||0;
     var ramOk = !f.ram_estimate_gb || sysInfo.ram_gb >= f.ram_estimate_gb;
-    // 能否完整驻留显存，要和"扣掉 KV cache 与运行开销后的预算"比，
-    // 而不是和显存总量比：15.9GB 的卡装不下 15.3GB 的权重。
-    var budget = (deviceRec&&deviceRec.gpu_max_model_gb)||0;
+    // 用规划预算提供筛选参考；不同模型的 KV cache 和缓冲区不同，不能保证加载成功。
+    var singleBudget=(deviceRec&&deviceRec.single_gpu_max_model_gb)||0;
+    var budget=(deviceRec&&deviceRec.gpu_max_model_gb)||0;
+    var configuredSplit=(currentConfig.gpu||{}).tensor_split;
+    var hasCustomSplit=Array.isArray(configuredSplit)?configuredSplit.length>0:!!String(configuredSplit||'').trim();
+    if(((currentConfig.gpu||{}).multi_gpu||'auto')!=='off'&&!hasCustomSplit){
+      budget=Math.max(budget,(deviceRec&&deviceRec.multi_gpu_max_model_gb)||0);
+    }
     var compat;
     if(!ramOk){
       compat = '<span class="tag tag-red">⚠️ 内存不足</span>';
     } else if(!sizeGb || vram<=0 || !budget){
       compat = '';   // 信息不足就不下结论
     } else if(sizeGb <= budget){
-      compat = '<span class="tag tag-green">✅ 可完整驻留显存</span>';
+      compat = '<span class="tag tag-green">'+(singleBudget&&sizeGb>singleBudget?'预计需要多 GPU，需启动验证':'预计在 GPU 权重预算内，需启动验证')+'</span>';
     } else if(sizeGb <= budget + vram*0.25){
-      compat = '<span class="tag tag-yellow">⚠️ 超出显存 '+(sizeGb-budget).toFixed(1)+'GB，部分层将落在 CPU，速度明显下降</span>';
+      compat = '<span class="tag tag-yellow">⚠️ 超出当前权重预算 '+(sizeGb-budget).toFixed(1)+'GB，可能需要多卡或 CPU 卸载</span>';
     } else {
-      compat = '<span class="tag tag-red">⚠️ 远超显存预算 '+budget.toFixed(1)+'GB，会非常慢</span>';
+      compat = '<span class="tag tag-red">⚠️ 超出当前 GPU 权重预算 '+budget.toFixed(1)+'GB，请检查分配计划</span>';
     }
     var checkboxId = 'chk-' + f.filename.replace(/[^a-zA-Z0-9]/g,'_');
     return '<div class="model-card" style="cursor:default;'+(checked?'border-color:var(--primary);background:var(--primary-bg)':'')+'" id="card-'+checkboxId+'">'+
@@ -3567,6 +3735,11 @@ async function loadConfig(){
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
   renderPresets();
   var bk=document.getElementById('cfg-gpu_backend');if(bk)bk.value=g.backend||'auto';
+  setVal('cfg-multi_gpu',g.multi_gpu||'auto');
+  populateMainGpuOptions(g.main_gpu);
+  setVal('cfg-split_mode',g.split_mode||'layer');
+  setVal('cfg-tensor_split',Array.isArray(g.tensor_split)?g.tensor_split.join(','):g.tensor_split||'');
+  setVal('cfg-gpu_reserve_mb',g.reserve_mb!=null?g.reserve_mb:1024);
   var glVal=g.gpu_layers!=null?g.gpu_layers:-1;
   setVal('cfg-gpu_layers',glVal);
   var glPreset=document.getElementById('cfg-gpu_layers_preset');
@@ -3600,6 +3773,16 @@ function defaultCfg(){
 }
 
 async function saveConfig(){
+  var tensorSplit=getVal('cfg-tensor_split');
+  if(tensorSplit){
+    var weights=tensorSplit.split(',');
+    if(weights.some(function(v){return !v.trim()||!Number.isFinite(Number(v))||Number(v)<0})||
+       !weights.some(function(v){return Number(v)>0})){
+      showToast('分配权重请输入逗号分隔的非负数，至少一个大于 0，例如 2,1',6000);return;
+    }
+  }
+  var gpuReserve=Number(getVal('cfg-gpu_reserve_mb'));
+  if(!Number.isInteger(gpuReserve)||gpuReserve<0){showToast('每卡预留显存必须是大于等于 0 的整数 MiB',6000);return}
   var oldModel=(currentConfig&&currentConfig.model)||{};
   var oldPerf=(currentConfig&&currentConfig.performance)||defaultCfg().performance;
   var oldCompat=(currentConfig&&currentConfig.compat)||defaultCfg().compat;
@@ -3626,6 +3809,11 @@ async function saveConfig(){
      compat:oldCompat,
      gpu:{backend:document.getElementById('cfg-gpu_backend').value||'auto',
          gpu_layers:getNum('cfg-gpu_layers',-1),
+         multi_gpu:getVal('cfg-multi_gpu')||'auto',
+         main_gpu:getVal('cfg-main_gpu')||'auto',
+         split_mode:getVal('cfg-split_mode')||'layer',
+         tensor_split:tensorSplit,
+         reserve_mb:gpuReserve,
          flash_attention:document.getElementById('cfg-flash_attn').classList.contains('on')},
     sampling:{temperature:getFloat('cfg-temperature',0.7),top_k:getNum('cfg-top_k',20),
               top_p:getFloat('cfg-top_p',0.8),presence_penalty:getFloat('cfg-presence_penalty',1.5),max_tokens:2048},
@@ -3633,7 +3821,10 @@ async function saveConfig(){
     build:{use_openblas:true,jobs:0},ui:{language:'zh',verbose:true}
   };
   var r=await api('/api/config','POST',cfg);
-  showToast((r&&r.message)?r.message:'已保存');
+  if(!r||r.error||r.status==='error'){showToast((r&&(r.error||r.message))||'保存失败',6000);return}
+  currentConfig=cfg;
+  showToast(r.message||'已保存');
+  await refreshDeviceRecommendations(true);
 }
 
 function resetConfig(){if(confirm('确定恢复默认配置？')){currentConfig=defaultCfg();loadConfig()}}
@@ -3877,10 +4068,8 @@ async function pollStatus(){
 }
 
 // ===== 系统信息 =====
-async function updateSystemPage(){
-  var i=sysInfo;var vram=i.gpu_vram_mb||0;
-  var rec=await api('/api/recommend?ram='+i.ram_gb+'&vram='+vram+'&vram_free='+(i.gpu_vram_free_mb||0));
-  deviceRec=rec;
+function updateSystemPage(){
+  var i=sysInfo,rec=deviceRec||{};
   document.getElementById('systemInfo').innerHTML=
     '<div class="card"><div class="card-title">🖥️ 硬件</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'+
@@ -3889,16 +4078,16 @@ async function updateSystemPage(){
     '<div class="form-group"><div class="form-label">内存</div><div style="font-size:18px;font-weight:600">'+i.ram_gb+' GB</div>'+
     '<div class="form-hint">可用: '+(i.ram_avail_gb||'?')+' GB</div></div>'+
     '<div class="form-group"><div class="form-label">磁盘</div><div style="font-size:18px;font-weight:600">'+i.disk_free_gb+' GB 可用</div></div>'+
-    (i.gpu_name?'<div class="form-group"><div class="form-label">GPU</div><div style="font-size:18px;font-weight:600">'+i.gpu_name+'</div>'+
-    '<div class="form-hint">显存: '+(i.gpu_vram_mb/1024).toFixed(1)+' GB · 可用: '+(i.gpu_vram_free_mb/1024).toFixed(1)+' GB</div></div>':'')+
+    '<div class="form-group" style="grid-column:1/-1"><div class="form-label">GPU 设备列表</div>'+gpuInventoryHtml(i)+'</div>'+
     '</div></div>'+
     '<div class="card"><div class="card-title">💡 AI 建议</div><div style="font-size:14px;line-height:2">'+
     (rec.gpu_max_model_gb
-      ?'<div>🎮 权重预算: <span class="tag tag-blue">≤'+rec.gpu_max_model_gb+' GB 可完整驻留显存</span></div>'
-      :'<div>📦 推荐量化: <span class="tag tag-green">'+(rec.recommended_quant||'Q4_K_M')+'</span></div>')+
-    '<div>📐 推荐 ctx: <span class="tag tag-yellow">'+(rec.recommended_ctx||2048)+'</span></div>'+
+      ?'<div>🎮 估算权重预算: <span class="tag tag-blue">约 '+rec.gpu_max_model_gb+' GiB</span></div>'
+      :'<div>📦 推荐量化: <span class="tag tag-green">'+esc(rec.recommended_quant||'Q4_K_M')+'</span></div>')+
+    '<div>📐 参考 ctx: <span class="tag tag-yellow">'+(rec.recommended_ctx!=null?rec.recommended_ctx:2048)+'</span></div>'+
+    gpuPlanHtml(rec)+
     '<hr style="border-color:var(--border);margin:8px 0">'+
-    ((rec.tips||[]).map(function(t){return'<div>• '+t+'</div>'}).join(''))+
+    ((rec.tips||[]).map(function(t){return'<div>• '+esc(t)+'</div>'}).join(''))+
     '</div></div>';
 }
 

@@ -42,7 +42,16 @@
   "gpu": {
     "backend": "auto",
     "gpu_layers": -1,
-    "flash_attention": true
+    "flash_attention": true,
+    // CUDA 多卡策略：auto 小模型用单卡，需要更多显存时才拆分；off 单卡；force 强制多卡。
+    "multi_gpu": "auto",
+    // auto 按可用资源选择主卡；也可填 NVIDIA 设备编号或 GPU UUID。
+    "main_gpu": "auto",
+    "split_mode": "layer",
+    // 留空按可用显存自动分配；非负数按引擎设备顺序填写，至少一项 > 0，例如 "2,1"。
+    "tensor_split": "",
+    // 多卡规划时每张卡额外预留 MiB；与 TTS、VRM 等共用设备时可提高。
+    "reserve_mb": 1024
   },
   "sampling": {
     "temperature": 0.7,

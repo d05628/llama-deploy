@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 import engines
+import multi_gpu
 
 if sys.platform == "win32":
     try:
@@ -626,36 +627,29 @@ def has_vulkan() -> bool:
 def accel(preferred="auto") -> dict:
     info = {"name": "", "gpu_count": 0, "vram_mb": 0, "vram_free_mb": 0, "compute_capability": "", "available_backends": ["cpu"], "selected_backend": "cpu", "reason": ""}
     try:
-        r = rc(["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"], 5)
+        r = rc(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free,compute_cap", "--format=csv,noheader,nounits"], 5)
+        if r.returncode != 0:
+            r = rc(["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"], 5)
         if r.returncode == 0 and r.stdout.strip():
-            names, totals, free_values = [], [], []
-            for line in r.stdout.strip().splitlines():
-                # GPU 名字可能含逗号，从右侧取两个数字字段。
-                parts = [x.strip() for x in line.rsplit(",", 2)]
-                if len(parts) != 3:
-                    continue
-                name_part, total_part, free_part = parts
-                names.append(name_part)
-                totals.append(int(total_part) if total_part.isdigit() else 0)
-                free_values.append(int(free_part) if free_part.isdigit() else 0)
-            if names:
+            devices = multi_gpu.parse_nvidia_inventory(r.stdout)
+            if devices:
                 info.update({
-                    "name": " + ".join(names),
-                    "gpu_count": len(names),
-                    "vram_mb": sum(totals),
-                    "vram_free_mb": sum(free_values),
+                    "name": " + ".join(item["name"] for item in devices),
+                    "gpu_count": len(devices), "gpus": devices,
+                    "vram_mb": sum(item["vram_mb"] for item in devices),
+                    "vram_free_mb": sum(item["vram_free_mb"] for item in devices),
                 })
-            info["available_backends"].append("cuda")
-            cap_result = rc(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"], 5)
-            if cap_result.returncode == 0:
-                capabilities = [
-                    value.strip() for value in cap_result.stdout.splitlines()
-                    if re.fullmatch(r"\d+(?:\.\d+)?", value.strip())
-                ]
+                info["available_backends"].append("cuda")
+                capabilities = [item["compute_capability"] for item in devices if item["compute_capability"]]
+                if not capabilities:
+                    cap_result = rc(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"], 5)
+                    if cap_result.returncode == 0:
+                        capabilities = [value.strip() for value in cap_result.stdout.splitlines()
+                                        if re.fullmatch(r"\d+(?:\.\d+)?", value.strip())]
+                        for item, capability in zip(devices, capabilities):
+                            item["compute_capability"] = capability
                 if capabilities:
-                    info["compute_capability"] = min(
-                        capabilities, key=lambda value: tuple(int(x) for x in value.split("."))
-                    )
+                    info["compute_capability"] = min(capabilities, key=lambda value: tuple(int(x) for x in value.split(".")))
     except Exception:
         pass
     if platform.system() == "Darwin":
@@ -674,6 +668,70 @@ def accel(preferred="auto") -> dict:
     else:
         info["reason"] = f"requested backend '{preferred}' is unavailable"
     return info
+
+
+def cuda_runtime_plan(binary, model, meta, gpu, gc, pc, ctx_size, vision=False, mmproj_mb=0.0):
+    """Use actual engine device names and per-card budgets for multi-card hosts."""
+    inventory = gpu.get("gpus", [])
+    explicit_main = str(gc.get("main_gpu", "auto")).lower() not in ("", "auto")
+    mode = str(gc.get("multi_gpu", "auto")).lower()
+    if mode not in ("auto", "off", "force"):
+        raise RuntimeError("gpu.multi_gpu 必须是 auto、off 或 force")
+    if gpu.get("selected_backend") != "cuda" or _safe_int(gc.get("gpu_layers", -1), -1) == 0:
+        if mode == "force":
+            raise RuntimeError("强制多卡需要 CUDA 后端且 gpu_layers 不能为 0")
+        return gpu, performance_tuning(model, meta, gpu, pc, ctx_size, vision, mmproj_mb), []
+    if len(inventory) <= 1 and not explicit_main and mode != "force":
+        # Preserve established single-card flags and performance defaults.
+        return gpu, performance_tuning(model, meta, gpu, pc, ctx_size, vision, mmproj_mb), []
+    try:
+        if not supports(binary, "--list-devices"):
+            raise ValueError("当前引擎不支持 --list-devices，无法可靠映射多显卡；请升级引擎")
+        result = rc([str(binary), "--list-devices"], 10)
+        devices = multi_gpu.match_engine_devices(inventory, multi_gpu.parse_engine_devices(
+            (result.stdout or "") + "\n" + (getattr(result, "stderr", "") or "")))
+        if result.returncode != 0 or not devices:
+            raise ValueError("当前引擎未列出可见 CUDA 设备，请检查驱动和 CUDA_VISIBLE_DEVICES")
+        primary = multi_gpu.choose_primary(devices, gc.get("main_gpu", "auto"))
+        primary_gpu = {**gpu, **primary, "name": primary["name"]}
+        initial = performance_tuning(model, meta, primary_gpu, pc, ctx_size, vision, mmproj_mb)
+        reserve = multi_gpu.configured_reserve(gc, initial["fit_target_mb"])
+        extra = mmproj_mb if vision and initial["mmproj_offload"] else 0.0
+        kv = kv_cache_mb(meta, initial["min_ctx"] if ctx_size <= 0 else ctx_size,
+                         initial["cache_type_k"], initial["cache_type_v"])
+        plan = multi_gpu.build_plan(devices, gc, initial["gpu_weight_mb"], kv, extra, reserve)
+        if plan['use_multi_gpu'] and plan['split_mode'] == 'row' and engines.prism_quant(model):
+            raise ValueError('Bonsai Prism 当前仅验证 layer 跨卡；该运行时存在 row 跨卡兼容问题，请改用 layer')
+        if plan["use_multi_gpu"] and any(not supports(binary, flag) for flag in
+                                               ("--split-mode", "--tensor-split", "--main-gpu")):
+            if mode == "force":
+                raise ValueError("当前引擎缺少强制多卡所需的分配参数，请升级引擎")
+            plan = multi_gpu.build_plan(devices, {**gc, "multi_gpu": "off"},
+                                         initial["gpu_weight_mb"], kv, extra, reserve)
+            plan["notes"].append("当前引擎缺少多卡分配参数，auto 已保留单卡运行")
+        flags = multi_gpu.launch_args(plan, help_text(binary))
+        if extra > 0:
+            if supports(binary, "--mmproj-device"):
+                flags += ["--mmproj-device", plan["device_names"][plan["main_gpu"]]]
+            elif plan["use_multi_gpu"] and plan["main_gpu"] != 0:
+                raise ValueError("当前引擎无法把视觉模块固定到规划主卡；请升级引擎或设置 performance.mmproj_offload=false")
+        selected = plan["devices"]
+        projected = {**gpu, "name": " + ".join(item["name"] for item in selected),
+                     "vram_mb": sum(item["vram_mb"] for item in selected),
+                     # performance_tuning subtracts primary overhead/margin once.
+                     "vram_free_mb": plan["payload_capacity_mb"] + 600 + extra + reserve,
+                     "physical_vram_free_mb": sum(multi_gpu.available_mb(item) for item in selected),
+                     "gpu_plan": plan, "active_gpu_count": len(selected),
+                     "compute_capability": min((item.get("compute_capability") or "0.0" for item in selected), key=_version_tuple)}
+        tuning = performance_tuning(model, meta, projected, {**pc, "fit_target_mb": reserve},
+                                    ctx_size, vision, mmproj_mb)
+        tuning["notes"].extend(plan["notes"])
+        tuning["recommended_ctx"] = multi_gpu.context_limit(
+            plan, tuning["gpu_weight_mb"], kv_cache_mb(meta, 1024, tuning["cache_type_k"], tuning["cache_type_v"]) / 1024,
+            meta.get("context_length", 0))
+        return projected, tuning, flags
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _version_tuple(value) -> tuple:
@@ -1201,11 +1259,11 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
         except OSError:
             pass
     ctx_size = _safe_int(sc.get("ctx_size"), 2048)
-    tuning = performance_tuning(model, meta, gpu, pc, ctx_size, vision, mmproj_mb)
+    gpu, tuning, gpu_flags = cuda_runtime_plan(binary, model, meta, gpu, gc, pc, ctx_size, vision, mmproj_mb)
     warn.extend(tuning["notes"])
 
     # ── 基础参数 ────────────────────────────────────────────────────────────
-    args = [str(binary), "-m", str(model)]
+    args = [str(binary), "-m", str(model)] + gpu_flags
     if supports(binary, "--jinja"):
         args.append("--jinja")
 
@@ -1458,7 +1516,7 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
             if supports(binary, "--fit"):
                 args += ["--fit", "on"]
             if supports(binary, "--fit-target"):
-                args += ["--fit-target", str(tuning["fit_target_mb"])]
+                args += ["--fit-target", str(int(tuning["fit_target_mb"]))]
         else:
             layers = (
                 auto_layers(model, gpu, vision, mmproj, meta)
@@ -1470,6 +1528,9 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
         args.append("--cpu-moe")
     elif _safe_int(pc.get("n_cpu_moe", 0), 0) > 0 and supports(binary, "--n-cpu-moe"):
         args += ["--n-cpu-moe", str(_safe_int(pc.get("n_cpu_moe"), 0))]
+
+    if gpu.get("gpu_plan") and "--fit-target" not in args and supports(binary, "--fit-target"):
+        args += ["--fit-target", str(int(tuning["fit_target_mb"]))]
 
     fa_flags = ["-fa"] if supports(binary, "-fa") else (["--flash-attn"] if supports(binary, "--flash-attn") else [])
     want_fa  = bool(gc.get("flash_attention", True)) and bool(fa_flags)
@@ -1534,10 +1595,18 @@ def summary(rt: dict, mode: str, vision: bool):
         print("   后端: CPU")
     else:
         msg = f"   后端: {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()}"
-        if gpu.get("vram_free_mb", 0) > 0: msg += f" | 可用显存: {gpu['vram_free_mb']}MB"
+        free_mb = gpu.get("physical_vram_free_mb", gpu.get("vram_free_mb", 0))
+        if free_mb > 0: msg += f" | 实时可用显存: {free_mb:.0f}MiB"
         if gpu.get("compute_capability"): msg += f" | CC {gpu['compute_capability']}"
         print(msg)
     tuning = rt.get("tuning", {})
+    plan = gpu.get("gpu_plan")
+    if plan:
+        print(f"   GPU 分配: {','.join(plan['device_names'])} | split-mode={plan['split_mode']} | main-gpu={plan['main_gpu']}")
+        if plan["tensor_split"]:
+            print("   tensor-split: " + ",".join(f"{value:.4f}" for value in plan["tensor_split"]))
+        if tuning.get("recommended_ctx") is not None:
+            print(f"   按模型元数据逐卡估算 ctx 上限: {tuning['recommended_ctx']}（以引擎实际分配为准）")
     if tuning:
         print(
             f"   性能策略: {tuning.get('profile', 'auto')} | KV {tuning.get('cache_type_k')}/{tuning.get('cache_type_v')}"
@@ -1546,7 +1615,8 @@ def summary(rt: dict, mode: str, vision: bool):
         if gpu.get("selected_backend") == "cuda" and tuning.get("gpu_weight_mb"):
             print(
                 f"   显存内权重: {tuning['gpu_weight_mb'] / 1024:.1f}GB | "
-                + ("可全部驻留 GPU（满速）" if tuning.get("gpu_fits") else "放不下，部分层会留在 CPU（降速）")
+                + (("预计可驻留 GPU（多卡速度需实测）" if plan and plan["use_multi_gpu"] else "可全部驻留 GPU（满速）")
+                   if tuning.get("gpu_fits") else "放不下，部分层会留在 CPU（降速）")
             )
     if rt["layers"] == -1: print("   GPU 卸载层数: auto")
     elif rt["layers"] > 0: print(f"   GPU 卸载层数: {rt['layers']}")
@@ -1804,9 +1874,8 @@ def cmd_benchmark(cfg: dict, sweep=False) -> int:
         raise RuntimeError("当前 llama.cpp 包缺少 llama-bench，请先运行 python deploy.py --upgrade-llama")
 
     meta = gguf_meta(model)
-    tuning = performance_tuning(
-        model, meta, gpu, pc, _safe_int(sc.get("ctx_size"), 8192), False, 0.0
-    )
+    gpu, tuning, gpu_flags = cuda_runtime_plan(
+        binary, model, meta, gpu, gc, pc, _safe_int(sc.get("ctx_size"), 8192), False, 0.0)
     fit_targets = (
         "256,384,512,768,1024" if sweep and gpu.get("selected_backend") != "cpu"
         else str(tuning["fit_target_mb"])
@@ -1817,6 +1886,7 @@ def cmd_benchmark(cfg: dict, sweep=False) -> int:
         "-ctk", tuning["cache_type_k"], "-ctv", tuning["cache_type_v"],
         "--prio", str(_safe_int(pc.get("priority", 2), 2)), "-o", "md", "--progress",
     ]
+    args += gpu_flags
     if gpu.get("selected_backend") != "cpu":
         args += ["-ngl", "-1", "-fa", "on", "--fit-target", fit_targets]
 

@@ -98,6 +98,11 @@ class AgentIsolationTests(unittest.TestCase):
         with mock.patch.object(agents, "IS_WIN", True):
             self.assertIn("--no-daemon", agents.command_args("codex", Path("h"), "local"))
 
+    def test_codex_model_is_pinned_on_the_command_line(self):
+        # 交互界面不认 config.toml 的 model，会换成 GPT 专用模型，本地模型每轮只写一段文字就停
+        args = agents.command_args("codex", Path("h"), "local")
+        self.assertEqual(args[args.index("-m") + 1], "local")
+
     def test_aider_confirms_edits_but_never_runs_commands_by_itself(self):
         args = agents.command_args("aider", Path("h"), "local")
         self.assertIn("--yes-always", args)

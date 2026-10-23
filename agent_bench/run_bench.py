@@ -242,6 +242,8 @@ def write_report(root: Path, results: list, n_ctx: int):
 
 
 def main():
+    # 中文 Windows 控制台是 GBK，打印 ▶ 这类字符会直接崩
+    sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--agents", default=",".join(a for a in agents.AGENTS if agents.installed(a)))
     ap.add_argument("--tasks", default=",".join(TASKS))

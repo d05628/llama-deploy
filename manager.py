@@ -53,7 +53,7 @@ from pathlib import Path
 #  常量
 # ============================================================
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "config.jsonc"
 PID_FILE = BASE_DIR / ".llama-server.pid"

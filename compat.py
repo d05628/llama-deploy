@@ -298,6 +298,145 @@ def prepare_openai_chat_payload(payload: dict) -> dict:
     return prepared
 
 
+_TEXT_TOOL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.S)
+_TEXT_TOOL_FUNC = re.compile(r"<function(?:=|\s+name=)[\"']?([^\"'>\s]+)[\"']?\s*>(.*?)(?:</function>|$)", re.S)
+_TEXT_TOOL_PARAM = re.compile(r"<parameter(?:=|\s+name=)[\"']?([^\"'>\s]+)[\"']?\s*>(.*?)</parameter>", re.S)
+
+
+def _text_tool_value(raw: str, schema: dict):
+    value = raw[1:] if raw.startswith("\n") else raw
+    value = value[:-1] if value.endswith("\n") else value
+    if (schema or {}).get("type") == "string":
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _parse_text_tool_call(body: str, tools: dict):
+    m = _TEXT_TOOL_FUNC.search(body)
+    if m:
+        name = m.group(1)
+        if name not in tools:
+            return None
+        props = (tools[name] or {}).get("properties") or {}
+        args = {key: _text_tool_value(val, props.get(key)) for key, val in _TEXT_TOOL_PARAM.findall(m.group(2))}
+        return name, args
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("name") not in tools:
+        return None
+    args = obj.get("arguments", obj.get("parameters", {}))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    return (obj["name"], args) if isinstance(args, dict) else None
+
+
+def recover_text_tool_calls(resp: dict, tools: list) -> dict:
+    """模型把工具调用写成了正文（如 <parameter name="cmd"> 这种 llama-server 解析不了的变体），
+    客户端只看到文字就结束这一轮，agent 停下来等人说"继续"。这里把正文里的调用还原成真正的 tool_calls。"""
+    names = {}
+    for tool in tools or []:
+        fn = (tool or {}).get("function") or {}
+        if fn.get("name"):
+            names[fn["name"]] = fn.get("parameters") or {}
+    choices = (resp or {}).get("choices") if isinstance(resp, dict) else None
+    if not names or not choices:
+        return resp
+    msg = choices[0].get("message") or {}
+    text = msg.get("content")
+    if msg.get("tool_calls") or not isinstance(text, str) or "<tool_call>" not in text:
+        return resp
+    calls = []
+    for body in _TEXT_TOOL_BLOCK.findall(text):
+        parsed = _parse_text_tool_call(body, names)
+        if parsed is None:
+            return resp  # 有一个认不出就原样交回，不猜
+        calls.append({"id": f"call_{uuid.uuid4().hex[:16]}", "type": "function",
+                      "function": {"name": parsed[0], "arguments": json.dumps(parsed[1], ensure_ascii=False)}})
+    if not calls:
+        return resp
+    msg = dict(msg, content=_TEXT_TOOL_BLOCK.sub("", text).strip(), tool_calls=calls)
+    choices = [dict(choices[0], message=msg, finish_reason="tool_calls")] + list(choices[1:])
+    return dict(resp, choices=choices)
+
+
+class TextToolCallStream:
+    """流式版的 recover_text_tool_calls：正文照常逐字转发，一旦出现 <tool_call> 就扣下后面的内容，
+    结束时能还原成工具调用就发 tool_calls，还原不了再把扣下的文字原样补发。"""
+    TAG = "<tool_call>"
+
+    def __init__(self, tools: list):
+        self.tools = tools
+        self.pending = ""   # 可能是 <tool_call> 开头一部分的尾巴，先不发
+        self.held = None    # 从 <tool_call> 起扣下的正文
+        self.done = False
+
+    @staticmethod
+    def _with_delta(ev: dict, delta: dict, finish=None) -> dict:
+        choice = dict((ev.get("choices") or [{}])[0], delta=delta, finish_reason=finish)
+        return dict(ev, choices=[choice])
+
+    def feed(self, ev: dict) -> list:
+        choices = ev.get("choices") if isinstance(ev, dict) else None
+        if self.done or not choices:
+            return [ev]
+        choice = choices[0]
+        delta = dict(choice.get("delta") or {})
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            if self.held is not None:
+                self.held += text
+                text = ""
+            else:
+                buf = self.pending + text
+                i = buf.find(self.TAG)
+                if i >= 0:
+                    text, self.held, self.pending = buf[:i], buf[i:], ""
+                else:
+                    keep = next((k for k in range(min(len(buf), len(self.TAG) - 1), 0, -1)
+                                 if self.TAG.startswith(buf[-k:])), 0)
+                    text, self.pending = buf[:len(buf) - keep], buf[len(buf) - keep:]
+            if text:
+                delta["content"] = text
+            else:
+                delta.pop("content", None)
+        finish = choice.get("finish_reason")
+        out = []
+        if delta:
+            out.append(self._with_delta(ev, delta))
+        if finish is not None:
+            out.extend(self.finish(ev, finish))
+        return out
+
+    def finish(self, ev: dict, finish_reason) -> list:
+        if self.done:
+            return []
+        self.done = True
+        out = []
+        if self.held is None:
+            if self.pending:
+                out.append(self._with_delta(ev, {"content": self.pending}))
+            return out + [self._with_delta(ev, {}, finish_reason)]
+        resp = {"choices": [{"message": {"role": "assistant", "content": self.held + self.pending}}]}
+        fixed = recover_text_tool_calls(resp, self.tools)
+        if fixed is resp:
+            out.append(self._with_delta(ev, {"content": self.held + self.pending}))
+            return out + [self._with_delta(ev, {}, finish_reason)]
+        msg = fixed["choices"][0]["message"]
+        if msg.get("content"):
+            out.append(self._with_delta(ev, {"content": msg["content"]}))
+        calls = [dict(call, index=k) for k, call in enumerate(msg["tool_calls"])]
+        out.append(self._with_delta(ev, {"tool_calls": calls}))
+        return out + [self._with_delta(ev, {}, "tool_calls")]
+
+
 def request_thinking_enabled(value, default: bool = False) -> bool:
     if value is None:
         return default
@@ -403,6 +542,24 @@ def openai_tools_from_responses(payload: dict) -> list:
                 },
             })
     return out
+
+
+CODE_MODE_NOTICE = (
+    "Codex 当前选用了 GPT 专用模型（{model}），它的工具要靠 JavaScript \"code mode\" 驱动，本地模型用不了，"
+    "只会写一段文字就停下。请从 llama-deploy 的「一键启动 Agent」重新打开 Codex，"
+    "或在 Codex 里输入 /model 改选 llama-deploy-local，然后新开一个会话。"
+)
+
+
+def responses_code_mode_notice(data: dict):
+    """Codex 对 gpt-5.6 这类模型不发 tools，而是在 input 里放 additional_tools（namespace/custom 工具）。
+    网关转不了这种工具，与其让模型把调用写成文字、每轮都停，不如直接说明原因和解决办法。"""
+    if openai_tools_from_responses(data):
+        return None
+    items = data.get("input") if isinstance(data.get("input"), list) else []
+    if any(isinstance(i, dict) and i.get("type") == "additional_tools" for i in items):
+        return CODE_MODE_NOTICE.format(model=data.get("model") or "?")
+    return None
 
 
 def tool_schemas_from_payload(payload: dict) -> dict:
@@ -992,7 +1149,13 @@ class CompatHandler(BaseHTTPRequestHandler):
         cc = compat_config(cfg)
         payload = prepare_openai_chat_payload(payload)
         payload["stream"] = False
-        return http_json("POST", cc["upstream_url"] + "/v1/chat/completions", payload, cc["request_timeout"])
+        status, resp = http_json("POST", cc["upstream_url"] + "/v1/chat/completions", payload, cc["request_timeout"])
+        if status < 400 and payload.get("tools"):
+            fixed = recover_text_tool_calls(resp, payload["tools"])
+            if fixed is not resp:
+                self.log_message("recovered %d textual tool call(s)", len(fixed["choices"][0]["message"]["tool_calls"]))
+            resp = fixed
+        return status, resp
 
     def _stream_ollama_chat(self, openai_payload: dict, cfg: dict, model: str):
         cc = compat_config(cfg)
@@ -1114,16 +1277,48 @@ class CompatHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self._cors()
             self.end_headers()
+            fixer = TextToolCallStream(payload["tools"]) if payload.get("tools") else None
             try:
-                while True:
-                    chunk = resp.read1(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if fixer is None:
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                else:
+                    self._proxy_sse_fixing(resp, fixer)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # 客户端断开：关闭上游连接，llama-server 随之停止生成
                 pass
+
+    def _proxy_sse_fixing(self, resp, fixer: "TextToolCallStream"):
+        last = None
+        for raw in resp:
+            line = raw.rstrip(b"\r\n")
+            if not line.startswith(b"data:"):
+                if line:
+                    self.wfile.write(line + b"\n\n")
+                    self.wfile.flush()
+                continue
+            data = line[5:].strip()
+            try:
+                event = json.loads(data)
+            except ValueError:
+                if data == b"[DONE]" and last is not None:
+                    self._write_sse_events(fixer.finish(last, "stop"))
+                self.wfile.write(line + b"\n\n")
+                self.wfile.flush()
+                continue
+            if isinstance(event, dict) and event.get("choices"):
+                last = event
+            self._write_sse_events(fixer.feed(event))
+
+    def _write_sse_events(self, events: list):
+        for event in events:
+            self.wfile.write(b"data: " + json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n")
+        if events:
+            self.wfile.flush()
 
     def _stream_openai_response(self, response: dict, headers_sent: bool = False):
         if not headers_sent:
@@ -1511,13 +1706,21 @@ class CompatHandler(BaseHTTPRequestHandler):
                 openai_payload["tools"] = tools
                 openai_payload["parallel_tool_calls"] = False
                 openai_payload["tool_choice"] = "auto"
+            notice = responses_code_mode_notice(data)
+            if notice:
+                def call():
+                    return 200, {"choices": [{"message": {"role": "assistant", "content": notice},
+                                              "finish_reason": "stop"}]}
+            else:
+                def call():
+                    return self._call_openai_chat(openai_payload, cfg)
             streaming = bool(data.get("stream"))
             if streaming:
                 # 先发响应头，等待上游完整生成期间用 SSE 注释行保活（客户端会忽略注释）
                 self._sse_headers()
                 try:
                     status, upstream = self._wait_with_heartbeat(
-                        lambda: self._call_openai_chat(openai_payload, cfg), b": keepalive\n\n")
+                        call, b": keepalive\n\n")
                 except CLIENT_GONE_ERRORS:
                     return
                 if status >= 400:
@@ -1531,7 +1734,7 @@ class CompatHandler(BaseHTTPRequestHandler):
                         pass
                     return
             else:
-                status, upstream = self._call_openai_chat(openai_payload, cfg)
+                status, upstream = call()
                 if status >= 400:
                     self._send_json(upstream, status)
                     return

@@ -14,6 +14,7 @@ def make_handler():
     handler.send_header = lambda k, v: handler.sent.setdefault(k, v)
     handler.end_headers = lambda: None
     handler._cors = lambda: None
+    handler.log_message = lambda *a: None
     return handler
 
 
@@ -220,6 +221,91 @@ class ChatStreamPassthroughTests(unittest.TestCase):
             handler._proxy_sse("http://upstream/v1/chat/completions", {"stream": True}, 5)
         self.assertEqual(handler.sent["status"], 200)
         self.assertEqual(handler.wfile.getvalue(), body)
+
+
+class TextToolCallRecoveryTests(unittest.TestCase):
+    TOOLS = [{"type": "function", "function": {"name": "exec_command", "parameters": {
+        "type": "object", "properties": {"cmd": {"type": "string"}, "timeout_ms": {"type": "number"}}}}}]
+
+    def recover(self, text):
+        resp = {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+        return compat.recover_text_tool_calls(resp, self.TOOLS)["choices"][0]
+
+    def test_name_attribute_variant_becomes_a_real_tool_call(self):
+        # Codex 实测：模型写 <parameter name="cmd">，llama-server 没解析，agent 一轮就停
+        text = ('先看看。\n\n<tool_call>\n<function=exec_command>\n<parameter name="cmd">\n'
+                'dir "C:\\a b"\n</parameter>\n<parameter=timeout_ms>\n5000\n</parameter>\n'
+                '</function>\n</tool_call>')
+        choice = self.recover(text)
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["content"], "先看看。")
+        call = choice["message"]["tool_calls"][0]["function"]
+        self.assertEqual(call["name"], "exec_command")
+        self.assertEqual(json.loads(call["arguments"]), {"cmd": 'dir "C:\\a b"', "timeout_ms": 5000})
+
+    def test_hermes_json_variant(self):
+        choice = self.recover('<tool_call>{"name": "exec_command", "arguments": {"cmd": "ls"}}</tool_call>')
+        self.assertEqual(json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]), {"cmd": "ls"})
+
+    def test_unknown_tool_or_plain_text_is_left_alone(self):
+        for text in ('<tool_call><function=rm_rf><parameter=path>/</parameter></function></tool_call>',
+                     "解释一下 <tool_call> 标签的格式"):
+            choice = self.recover(text)
+            self.assertEqual(choice["message"]["content"], text)
+            self.assertNotIn("tool_calls", choice["message"])
+
+    def test_upstream_call_applies_recovery_only_when_tools_declared(self):
+        text = '<tool_call><function=exec_command><parameter=cmd>ls</parameter></function></tool_call>'
+        upstream = {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+        handler = make_handler()
+        with mock.patch.object(compat, "http_json", return_value=(200, upstream)):
+            _, with_tools = handler._call_openai_chat({"messages": [], "tools": self.TOOLS}, {})
+            _, without = handler._call_openai_chat({"messages": []}, {})
+        self.assertEqual(with_tools["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(without["choices"][0]["message"]["content"], text)
+
+    def test_gpt_code_mode_request_gets_an_explanation_instead_of_silence(self):
+        data = {"model": "gpt-5.6-sol", "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [{"type": "namespace", "name": "functions"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]}
+        self.assertIn("llama-deploy-local", compat.responses_code_mode_notice(data))
+        data["tools"] = [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]
+        self.assertIsNone(compat.responses_code_mode_notice(data))
+
+    def stream(self, pieces, tools=True):
+        class Upstream(io.BytesIO):
+            headers = {"Content-Type": "text/event-stream"}
+
+            def getcode(self):
+                return 200
+
+        chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}]
+        chunks += [{"choices": [{"index": 0, "delta": {"content": p}, "finish_reason": None}]} for p in pieces]
+        chunks += [{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+        body = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks) + b"data: [DONE]\n\n"
+        handler = make_handler()
+        payload = {"stream": True, "tools": self.TOOLS} if tools else {"stream": True}
+        with mock.patch.object(compat.urllib.request, "urlopen", return_value=Upstream(body)):
+            handler._proxy_sse("http://upstream/v1/chat/completions", payload, 5)
+        raw = handler.wfile.getvalue()
+        self.assertTrue(raw.endswith(b"data: [DONE]\n\n"))
+        return raw[:-len(b"data: [DONE]\n\n")]
+
+    def test_stream_text_tool_call_split_across_chunks_is_recovered(self):
+        out = events(self.stream(["好的<tool", "_call>\n<function=exec_command>\n<parameter name=\"cmd\">",
+                                  "ls\n</parameter>\n</function>\n</tool_call>"]))
+        text = "".join((e["choices"][0]["delta"].get("content") or "") for e in out if e.get("choices"))
+        self.assertEqual(text, "好的")
+        calls = [c for e in out if e.get("choices") for c in e["choices"][0]["delta"].get("tool_calls", [])]
+        self.assertEqual(calls[0]["function"]["name"], "exec_command")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"cmd": "ls"})
+        self.assertEqual([e["choices"][0]["finish_reason"] for e in out if e.get("choices")][-1], "tool_calls")
+
+    def test_stream_plain_text_keeps_every_character(self):
+        out = events(self.stream(["a <", "b> <tool", " c"]))
+        text = "".join((e["choices"][0]["delta"].get("content") or "") for e in out if e.get("choices"))
+        self.assertEqual(text, "a <b> <tool c")
+        self.assertEqual(out[-1]["choices"][0]["finish_reason"], "stop")
 
 
 if __name__ == "__main__":

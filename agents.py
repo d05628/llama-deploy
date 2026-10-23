@@ -160,10 +160,16 @@ def command_args(agent: str, home: Path, alias: str) -> list:
                 # 不自动执行 shell 命令：Aider 的 --yes-always 会连"运行命令"也一并同意，
                 # 所以干脆不让它提议执行命令
                 "--yes-always", "--no-suggest-shell-commands"]
-    if agent == "codex" and IS_WIN:
-        # Codex 0.157 起默认启动共享后台服务，在管理员窗口里拒绝运行：
-        # "start the Windows daemon from a non-elevated terminal"
-        return ["--no-daemon"]
+    if agent == "codex":
+        # 交互界面不认 config.toml 里的 model，会换成 gpt-5.6-sol 这类 GPT 专用模型；
+        # 那一类用 JavaScript "code mode" 驱动工具，本地模型用不了，每轮只写一段文字就停。
+        # 命令行指定后走通用的 exec_command / apply_patch 工具
+        args = ["-m", alias]
+        if IS_WIN:
+            # Codex 0.157 起默认启动共享后台服务，在管理员窗口里拒绝运行：
+            # "start the Windows daemon from a non-elevated terminal"
+            args.append("--no-daemon")
+        return args
     return []
 
 

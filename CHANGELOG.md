@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.6.1] - 2026-09-27
+
+### 修复
+
+- **Codex 每轮只说一句话就停下，要人说"继续"**：Codex 交互界面不认 `config.toml` 里的 `model`，
+  会自动换成 `gpt-5.6-sol` / `gpt-6-sol` 这类 GPT 专用模型（`codex exec` 则不会，所以测试题组没测出来）。
+  对这类模型 Codex 不发普通的工具列表，而是改用 JavaScript "code mode" 驱动工具，本地模型根本拿不到可用的工具，
+  只能把调用写成文字，客户端当成普通回复结束这一轮。现在一键启动时用 `-m llama-deploy-local` 固定模型，
+  走通用的 `exec_command` / `apply_patch` 工具；万一在 Codex 里用 `/model` 又切到 GPT 专用模型，
+  网关会直接回复原因和解决办法，不再默默停下。旧会话里模型已经学会了写文字调用，请新开一个会话。
+- **兜底：把写成正文的工具调用还原成真正的工具调用**。模型偶尔会写出
+  `<parameter name="cmd">` 这类 llama-server 解析不了的变体，兼容网关现在能识别
+  （`<parameter=…>`、`<parameter name="…">`、JSON 形式），Codex / Claude Code / Gemini CLI 的非流式路径和
+  OpenCode / Qwen Code 的流式路径都覆盖；只还原请求里声明过的工具，认不出的原样交回。
+- `agent_bench/run_bench.py` 在中文 Windows 控制台（GBK）下打印 ▶ 时崩溃。
+
 ## [1.6.0] - 2026-09-26
 
 ### 新增：agent 测试题组（`agent_bench/`）

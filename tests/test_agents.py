@@ -67,6 +67,19 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertNotIn("setx", text.lower())
         self.assertNotIn("reg add", text.lower())
 
+    def test_launcher_starts_the_gateway_before_the_agent(self):
+        # 重启电脑后直接双击启动器，网关不在运行，Codex 只会一直 "Reconnecting..."
+        for is_win in (True, False):
+            with self.subTest(is_win=is_win), tempfile.TemporaryDirectory() as tmp,                     mock.patch.object(agents, "IS_WIN", is_win):
+                base = Path(tmp)
+                (base / "compat.py").write_text("", encoding="utf-8")
+                env = agents.build_env("codex", base / "agents" / "codex", GATEWAY, "local", "k", 47104)
+                lines = agents.write_launcher(base, "codex", env, base, ["-m", "local"]).read_text(
+                    encoding=agents.LAUNCHER_ENCODING if is_win else "utf-8").splitlines()
+            start = next(i for i, line in enumerate(lines) if "compat.py" in line and " start " in line + " ")
+            agent = next(i for i, line in enumerate(lines) if "codex -m local" in line)
+            self.assertLess(start, agent)
+
     def test_default_workspace_is_not_the_home_folder(self):
         # 默认用整个用户目录时，OpenCode 一直卡在给整个目录做快照
         self.assertNotEqual(agents.default_workspace().resolve(), Path.home().resolve())

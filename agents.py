@@ -12,6 +12,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 IS_WIN = platform.system() == "Windows"
@@ -312,8 +313,13 @@ def write_launcher(base_dir: Path, agent: str, env: dict, cwd: Path, args: list 
                 lines.append(f'set "PATH=%PATH%;{tool_dir}"')
         command = " ".join([command] + [f'"{a}"' if " " in a else a for a in args])
         lines += [f'cd /d "{cwd}"',
-                  f"echo {name} 正在使用本地模型（仅此窗口生效；平时直接运行 {base_command} 仍走官方）",
-                  command]
+                  f"echo {name} 正在使用本地模型（仅此窗口生效；平时直接运行 {base_command} 仍走官方）"]
+        # 重启电脑后直接双击启动器时网关不在运行，Codex 只会一直显示
+        # "Reconnecting... waiting for network"；compat.py start 已在运行时直接返回
+        gateway_start = _gateway_start_command(base_dir)
+        if gateway_start:
+            lines.append(f'{gateway_start} >nul 2>&1 || echo 兼容网关启动失败，请在管理器里查看网关日志')
+        lines.append(command)
         path = out_dir / f"launch-{agent}.cmd"
         # newline="" 原样写入：否则 Windows 文本模式会把 \n 再转一次，变成 \r\r\n
         with open(path, "w", encoding=LAUNCHER_ENCODING, errors="replace", newline="") as f:
@@ -322,11 +328,22 @@ def write_launcher(base_dir: Path, agent: str, env: dict, cwd: Path, args: list 
         import shlex
         lines = ["#!/bin/sh"]
         lines += [f"unset {k}" if v == "" else f"export {k}={shlex.quote(v)}" for k, v in env.items()]
-        lines += [f"cd {shlex.quote(str(cwd))}", "exec " + " ".join([command] + [shlex.quote(a) for a in args])]
+        lines.append(f"cd {shlex.quote(str(cwd))}")
+        if (base_dir / "compat.py").exists():
+            lines.append(f"{shlex.quote(sys.executable)} {shlex.quote(str(base_dir / 'compat.py'))} start >/dev/null 2>&1"
+                         " || echo 'compat gateway failed to start; check .compat-server.log'")
+        lines.append("exec " + " ".join([command] + [shlex.quote(a) for a in args]))
         path = out_dir / f"launch-{agent}.sh"
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         path.chmod(0o755)
     return path
+
+
+def _gateway_start_command(base_dir: Path) -> str:
+    compat = base_dir / "compat.py"
+    if not compat.exists() or _UNSAFE_CHARS & set(sys.executable + str(compat)):
+        return ""
+    return f'"{sys.executable}" "{compat}" start'
 
 
 def open_terminal(launcher: Path):

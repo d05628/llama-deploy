@@ -8,7 +8,7 @@ python agent_bench/run_bench.py                                   # 所有已安
 python agent_bench/run_bench.py --agents claude,codex --tasks svg,bugfix
 ```
 
-结果在 `~/llama-agent-workspace/bench/<时间>/`：`report.md`（汇总表 + 明细）、`results.json`、
+结果在项目内的 `workspace/bench/<时间>/`（已 git 忽略）：`report.md`（汇总表 + 明细）、`results.json`、
 每个 agent × 题目的工作目录（产物都在里面）和 `logs/`。运行前会自动把模型服务切到
 agent + 看图模式，并启动兼容网关。
 

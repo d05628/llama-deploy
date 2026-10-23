@@ -13,7 +13,14 @@
   （交给引擎会开到约 220K，KV 把缓存挤掉），ubatch 1024 让长提示预填充快约 2.2 倍；其余显卡承载视觉模块。
   RTX 5060 Ti + 3060 Ti 实测吐字 26.2 → 34.6 tok/s，3K 提示预填充约 110 → 283 tok/s。
   主模型跨两卡切分、外挂 MTP 草稿头均实测更慢，未采用（原因见 README）。
+- **agent 默认工作目录移到项目内的 `workspace/`**（已 git 忽略），渲染帧等产物不再占用系统盘。
+  在项目内运行时启动器设置 `GIT_CEILING_DIRECTORIES`，agent 的 git 操作找不到 llama-deploy 自己的仓库，
+  不会把整个项目当成工程做快照，也不会误提交到本仓库。
 
+### 修复
+
+- **重启电脑后双击 agent 启动器，Codex 一直 "Reconnecting... waiting for network"**：启动器只设置环境变量，
+  兼容网关原本由 Web 管理器启动，重启后没人拉起它。启动器现在先运行 `compat.py start`（已在运行时立即返回）。
 - **Codex 每轮只说一句话就停下，要人说"继续"**：Codex 交互界面不认 `config.toml` 里的 `model`，
   会自动换成 `gpt-5.6-sol` / `gpt-6-sol` 这类 GPT 专用模型（`codex exec` 则不会，所以测试题组没测出来）。
   对这类模型 Codex 不发普通的工具列表，而是改用 JavaScript "code mode" 驱动工具，本地模型根本拿不到可用的工具，

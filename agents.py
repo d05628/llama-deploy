@@ -262,9 +262,23 @@ def prepare_home(agent: str, home: Path, gateway: str, alias: str, n_ctx: int, v
         path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
 def default_workspace() -> Path:
-    """agent 默认工作目录。不用用户主目录：agent 会扫描/快照整个工作目录，主目录太大。"""
-    return Path.home() / "llama-agent-workspace"
+    """agent 默认工作目录：项目内的 workspace/（已 git 忽略），渲染帧等产物不占系统盘。
+    不用用户主目录：agent 会扫描/快照整个工作目录，主目录太大。"""
+    return PROJECT_DIR / "workspace"
+
+
+def git_isolation_env(cwd: Path) -> dict:
+    """工作目录在本项目内时，挡住 git 向上找到 llama-deploy 自己的仓库：
+    否则 OpenCode 会把整个项目当成工程做快照，agent 的 git add/commit 会提交到本仓库。"""
+    try:
+        Path(cwd).resolve().relative_to(PROJECT_DIR)
+    except ValueError:
+        return {}
+    return {"GIT_CEILING_DIRECTORIES": str(PROJECT_DIR)}
 
 
 def workspace_warning(path: Path) -> str:
@@ -292,6 +306,7 @@ def validate_cwd(cwd: str) -> Path:
 
 def write_launcher(base_dir: Path, agent: str, env: dict, cwd: Path, args: list = (), extra_path: list = ()) -> Path:
     """生成可重复双击使用的启动器。环境变量只在这个窗口的进程里生效。"""
+    env = {**env, **git_isolation_env(cwd)}
     for key, value in list(env.items()) + [("args", a) for a in args]:
         if _UNSAFE_CHARS & set(value):
             raise ValueError(f"{key} 的值含有无法安全写入启动器的字符")

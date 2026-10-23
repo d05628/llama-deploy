@@ -87,6 +87,18 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertTrue(agents.workspace_warning(Path(Path.home().anchor)))
         self.assertEqual(agents.workspace_warning(agents.default_workspace()), "")
 
+    def test_default_workspace_is_inside_the_project_and_isolated_from_its_repo(self):
+        workspace = agents.default_workspace()
+        self.assertEqual(workspace.parent, agents.PROJECT_DIR)
+        # agent 在 workspace 里执行 git 时不能找到 llama-deploy 自己的仓库
+        self.assertEqual(agents.git_isolation_env(workspace / "demo"),
+                         {"GIT_CEILING_DIRECTORIES": str(agents.PROJECT_DIR)})
+        self.assertEqual(agents.git_isolation_env(Path.home()), {})
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agents, "IS_WIN", True):
+            text = agents.write_launcher(Path(tmp), "codex", {}, workspace).read_text(
+                encoding=agents.LAUNCHER_ENCODING)
+        self.assertIn(f'set "GIT_CEILING_DIRECTORIES={agents.PROJECT_DIR}"', text)
+
     def test_vision_is_declared_to_tools_that_would_otherwise_assume_text_only(self):
         # Qwen Code / OpenCode 对未知模型名按纯文本处理，不声明就不发图（实测回答"不支持图片"）
         with tempfile.TemporaryDirectory() as tmp:

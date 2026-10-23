@@ -169,6 +169,7 @@ def prepare(agent: str, task: dict, work: Path, n_ctx: int) -> tuple:
         else:
             env[k] = v
     env["PWD"] = str(work)
+    env.update(agents.git_isolation_env(work))
     extra = [str(p) for p in agents.find_tool_dirs()]
     exe = agents.command_path(agent)
     if exe:

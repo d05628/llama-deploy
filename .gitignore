@@ -38,6 +38,9 @@ dist/
 tmp/
 temp/
 
+# Default agent workspace (renders, bench runs)
+workspace/
+
 # Logs, PIDs and caches
 *.log
 log.txt

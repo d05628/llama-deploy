@@ -82,7 +82,9 @@
     "kv_unified": true,
     "ctx_checkpoints": 32,
     "cpu_moe": false,
-    "n_cpu_moe": 0
+    "n_cpu_moe": 0,
+    "qwen38_preset": "off",
+    "qwen38_moe_cache_mib": 0
   },
   "build": {
     "use_openblas": true,

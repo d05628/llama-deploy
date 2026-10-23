@@ -86,6 +86,7 @@ assert(context.gpuPlanHtml({gpu_plan: {error: '<bad config>'}}).includes('&lt;ba
         self.run_ui(r"""
 context.sysInfo = {gpus};
 Object.assign(cfg.gpu, {multi_gpu: 'force', main_gpu: 'GPU-one', split_mode: 'row', tensor_split: '0,2', reserve_mb: 2048});
+Object.assign(cfg.performance, {qwen38_preset: 'fast_quality', qwen38_moe_cache_mib: 4096});
 let saved = null, refreshed = null;
 context.api = async (url, method, body) => {
   assert.equal(url, '/api/config');
@@ -101,6 +102,8 @@ assert(saved && refreshed === true);
 for (const key of ['multi_gpu', 'main_gpu', 'split_mode', 'tensor_split', 'reserve_mb']) {
   assert.equal(saved.gpu[key], cfg.gpu[key], key);
 }
+assert.equal(saved.performance.qwen38_preset, 'fast_quality');
+assert.equal(saved.performance.qwen38_moe_cache_mib, 4096);
 saved = null; refreshed = null;
 elements.get('cfg-tensor_split').value = '0,0';
 await context.saveConfig();
@@ -112,6 +115,14 @@ for (const invalid of ['-1,2', 'NaN,1', 'Infinity,1', '1,']) {
 elements.get('cfg-tensor_split').value = '';
 elements.get('cfg-gpu_reserve_mb').value = '-1';
 await context.saveConfig(); assert.equal(saved, null);
+elements.get('cfg-gpu_reserve_mb').value = '2048';
+elements.get('cfg-qwen38_moe_cache_mib').value = '256';
+await context.saveConfig(); assert.equal(saved, null);
+elements.get('cfg-qwen38_moe_cache_mib').value = '4096';
+elements.get('cfg-qwen38_preset').value = 'fast_quality';
+await context.saveConfig();
+assert.equal(saved.performance.qwen38_preset, 'fast_quality');
+assert.equal(saved.performance.qwen38_moe_cache_mib, 4096);
 """)
 
     def test_refresh_uses_saved_model_plan_and_renders_all_devices(self):

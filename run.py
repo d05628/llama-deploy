@@ -346,30 +346,52 @@ def gguf_tensor_sizes(model_path: Path) -> dict:
     sizes = {}
     try:
         if len(model_files(model_path)) == 1:
-            with open(model_path, "rb") as f:
-                if _rx(f, 4) == b"GGUF" and _u32(f) >= 2:
-                    n_tensors, n_kv = _u64(f), _u64(f)
-                    alignment = 32
-                    for _ in range(n_kv):
-                        k, t = _s(f), _u32(f)
-                        if k == "general.alignment" and t in (4, 5, 10, 11):
-                            alignment = int(_scalar(f, t)) or 32
-                        else:
-                            _skip(f, t)
-                    infos = []
-                    for _ in range(n_tensors):
-                        name = _s(f)
-                        f.seek(8 * _u32(f) + 4, 1)  # dims + type
-                        infos.append((_u64(f), name))
-                    data_start = -(-f.tell() // alignment) * alignment
-                    end = model_path.stat().st_size - data_start
-                    infos.sort()
-                    for i, (offset, name) in enumerate(infos):
-                        sizes[name] = (infos[i + 1][0] if i + 1 < len(infos) else end) - offset
+            sizes = _gguf_file_tensor_sizes(model_path)
     except Exception:
         sizes = {}
     TENSOR_SIZE_CACHE[key] = sizes
     return sizes
+
+
+def _gguf_file_tensor_sizes(path: Path) -> dict:
+    """单个 GGUF 文件（可以是分片之一）内的 {张量名: 字节数}。"""
+    sizes = {}
+    with open(path, "rb") as f:
+        if _rx(f, 4) != b"GGUF" or _u32(f) < 2:
+            return sizes
+        n_tensors, n_kv = _u64(f), _u64(f)
+        alignment = 32
+        for _ in range(n_kv):
+            k, t = _s(f), _u32(f)
+            if k == "general.alignment" and t in (4, 5, 10, 11):
+                alignment = int(_scalar(f, t)) or 32
+            else:
+                _skip(f, t)
+        infos = []
+        for _ in range(n_tensors):
+            name = _s(f)
+            f.seek(8 * _u32(f) + 4, 1)  # dims + type
+            infos.append((_u64(f), name))
+        data_start = -(-f.tell() // alignment) * alignment
+        end = path.stat().st_size - data_start
+        infos.sort()
+        for i, (offset, name) in enumerate(infos):
+            sizes[name] = (infos[i + 1][0] if i + 1 < len(infos) else end) - offset
+    return sizes
+
+
+def gpu_dense_mb(model_path: Path) -> float:
+    """--cpu-moe 下仍进显存的权重：除专家与按行查表的嵌入之外的全部张量（MiB）。
+    逐个分片解析；解析失败返回 0，调用方据此放弃自动估算。"""
+    total = 0
+    try:
+        for part in model_files(model_path):
+            for name, size in _gguf_file_tensor_sizes(Path(part)).items():
+                if "_exps" not in name and name not in ("token_embd.weight", "per_layer_token_embd.weight"):
+                    total += size
+    except Exception:
+        return 0.0
+    return total / (1024 * 1024)
 
 
 def gpu_weight_mb(model_path: Path, meta: dict, mtp_enabled: bool = False) -> float:
@@ -1205,6 +1227,94 @@ def _safe_int_min(val, default: int, minimum: int) -> int:
 AGENT_OVERRIDES = {"spec_type": "ngram", "cache_type_k": "q4_0", "cache_type_v": "q4_0"}
 
 
+def qwen38_launch_overrides(binary, model, meta, mode, sc, gc, pc):
+    """Apply the opt-in Flash-Next profile without changing persisted settings."""
+    sc, gc, pc = dict(sc), dict(gc), dict(pc)
+    if mode != "server" or not is_qwen38_flash_next(model, meta):
+        return sc, gc, pc, False, []
+    preset = str(pc.get("qwen38_preset", "off") or "off").strip().lower()
+    if preset in ("", "off", "none", "0", "false"):
+        return sc, gc, pc, False, []
+    if preset != "fast_quality":
+        return sc, gc, pc, False, [f"未知 Qwen3.8 预设 {preset}，已按通用配置启动"]
+
+    required = ("--device", "--list-devices", "--fit", "--cpu-moe", "--moe-cache-mib",
+                "--load-mode", "--lazy-mode")
+    missing = [flag for flag in required if not supports(binary, flag)]
+    if not supports_value(binary, "-ngl", "auto"):
+        missing.append("-ngl auto")
+    if missing:
+        return sc, gc, pc, False, [
+            "Qwen3.8 高速预设需要当前引擎支持 " + ", ".join(missing) + "；本次保持通用配置，未阻止模型加载"
+        ]
+
+    try:
+        cache_mib = int(pc.get("qwen38_moe_cache_mib", 0))
+    except (TypeError, ValueError):
+        cache_mib = 0
+    # 0 = 按主卡余量自动取最大；手工值在 qwen38_cache_mib() 里再按余量封顶。
+    cache_mib = 0 if cache_mib <= 0 else max(512, min(cache_mib, QWEN38_CACHE_MAX_MIB))
+    ctx_size = _safe_int(sc.get("ctx_size"), 0)
+    # Experts cached on a second card miss over that card's own PCIe link; on
+    # consumer boards it is usually a chipset x4 slot, measured slower than one
+    # card (2x RTX: 33-38.8 vs 40 t/s). Spare cards host the vision encoder instead.
+    gc.update(multi_gpu="off", tensor_split="", gpu_layers=-1)
+    # ubatch 1024: 3K-token prompts prefill 2.2x faster than 256 for ~5% decode.
+    pc.update(profile="quality", spec_type="off", cache_type_k="f16", cache_type_v="f16",
+              parallel=1, batch_size=2048, ubatch_size=1024, auto_gpu_layers=True,
+              cpu_moe=True, n_cpu_moe=0, moe_cache_mib=cache_mib,
+              load_mode="mmap", lazy_mode="on")
+    # --fit cannot size the context here (see qwen38_cache_mib), and leaving it
+    # to the engine opens ~220K tokens whose KV crowds the expert cache out.
+    sc.update(ctx_size=ctx_size if ctx_size > 0 else QWEN38_DEFAULT_CTX,
+              enable_thinking=True, reasoning_budget=2048)
+    return sc, gc, pc, True, [
+        "已应用 Qwen3.8 高速高质量预设：主模型放在空闲显存最大的显卡，非专家层全部驻留 GPU，"
+        "专家留在内存并把热点专家缓存到显存；按需映射 n-gram 表，保留 f16 KV 与思考模式；MTP 保持关闭"
+    ]
+
+
+QWEN38_CACHE_MAX_MIB = 32768
+QWEN38_DEFAULT_CTX = 65536
+
+
+def qwen38_cache_mib(model, meta, gpu, tuning, pc, ctx_size, mmproj_on_main_mb):
+    """Largest expert cache the main GPU can hold next to the dense layers, KV and compute buffers.
+
+    --fit cannot do this: --cpu-moe sets tensor overrides, which makes the fit
+    abort, and an oversized cache then fails at the first cuBLAS allocation
+    (CUDA OOM) instead of shrinking. Measured on a 16GB card: 10240MiB leaves
+    ~1.2GB free at 16K context, 11264MiB crashes.
+    """
+    plan = gpu.get("gpu_plan") or {}
+    devices = plan.get("devices") or []
+    if devices:
+        # payload_budget_mb already charged the vision encoder to the main card,
+        # which may since have moved; start from the raw free memory instead.
+        main = devices[plan.get("main_gpu") or 0]
+        budget = multi_gpu.available_mb(main) - plan.get("reserve_mb", 0) - 600 - mmproj_on_main_mb
+    else:
+        budget = (gpu.get("vram_free_mb", 0) or 0) - 600 - tuning.get("fit_target_mb", 0) - mmproj_on_main_mb
+    dense = gpu_dense_mb(model)
+    if dense <= 0:
+        return min(pc.get("moe_cache_mib") or 4096, 4096), "无法解析模型张量体积，专家缓存按保守值处理"
+    kv = kv_cache_mb(meta, ctx_size, tuning["cache_type_k"], tuning["cache_type_v"])
+    # Compute buffers grow with ubatch x context (measured ub1024: 225MiB at
+    # 16K, 831MiB at 64K); the constants keep ~200MiB above those readings.
+    ubatch = _safe_int(pc.get("ubatch_size"), 1024)
+    compute = 128 + 0.05 * ubatch + 1.3e-5 * ubatch * ctx_size
+    ceiling = int(max(0.0, budget - dense - kv - compute) // 256 * 256)
+    if ceiling < 512:
+        return 0, f"主卡余量放不下非专家层 {dense:.0f}MiB + KV {kv:.0f}MiB，已关闭专家缓存；可缩短上下文"
+    requested = pc.get("moe_cache_mib") or 0
+    if requested and requested <= ceiling:
+        return requested, f"专家缓存 {requested}MiB（手动设置，当前余量最多 {ceiling}MiB）"
+    if requested:
+        return ceiling, f"手动设置的专家缓存 {requested}MiB 超出主卡余量，已降到 {ceiling}MiB，避免首次推理时 CUDA OOM"
+    return ceiling, (f"专家缓存自动取主卡余量 {ceiling}MiB（非专家层 {dense:.0f}MiB + {ctx_size} 上下文 KV {kv:.0f}MiB 之外）；"
+                     "缓存越大命中率越高，缩短上下文可换更大缓存")
+
+
 def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     sc  = cfg.get("server", {})
     sp  = cfg.get("sampling", {})
@@ -1238,6 +1348,9 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     )
     meta = gguf_meta(model)
     warn = []
+    sc, gc, pc, qwen38_preset_active, preset_notes = qwen38_launch_overrides(
+        binary, model, meta, mode, sc, gc, pc)
+    warn.extend(preset_notes)
     mmproj = configured_mmproj
 
     # ── 视觉模块匹配 ────────────────────────────────────────────────────────
@@ -1260,6 +1373,31 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
             pass
     ctx_size = _safe_int(sc.get("ctx_size"), 2048)
     gpu, tuning, gpu_flags = cuda_runtime_plan(binary, model, meta, gpu, gc, pc, ctx_size, vision, mmproj_mb)
+    if qwen38_preset_active:
+        # Whole-model VRAM estimates assume every expert is GPU-resident; this
+        # profile deliberately keeps MoE experts on the host and caches hot rows.
+        tuning["notes"] = [note for note in tuning["notes"]
+                           if "需进显存的权重" not in note and "逐卡预算无法完整容纳权重" not in note
+                           and "当前使用单卡" not in note]
+        mmproj_on_main = mmproj_mb if vision and mmproj_mb > 0 and tuning["mmproj_offload"] else 0.0
+        spare = next((item for item in (gpu.get("gpu_plan") or {}).get("spare_devices", [])
+                      if item.get("payload_budget_mb", 0) >= mmproj_mb * 1.5 + 1024), None)
+        if vision and mmproj_mb > 0 and spare and supports(binary, "--mmproj-device"):
+            # A spare card costs the main card nothing, so it also beats the CPU
+            # placement that mmproj_offload=false chooses to protect main VRAM.
+            if "--mmproj-device" in gpu_flags:
+                gpu_flags[gpu_flags.index("--mmproj-device") + 1] = spare["device"]
+            else:
+                gpu_flags += ["--mmproj-device", spare["device"]]
+            tuning["mmproj_offload"] = True
+            mmproj_on_main = 0.0
+            tuning["notes"].append(f"视觉模块放到 {spare['name']}，主卡显存全部留给专家缓存")
+        pc["moe_cache_mib"], cache_note = qwen38_cache_mib(
+            model, meta, gpu, tuning, pc, ctx_size, mmproj_on_main)
+        tuning["notes"].append(cache_note)
+        tuning["notes"].append(
+            "Qwen3.8 专家热缓存模式：专家主体留在系统内存，未命中的专家经 PCIe 临时传到 GPU 计算；"
+            "吞吐取决于缓存命中率、内存频率与主卡 PCIe 带宽")
     warn.extend(tuning["notes"])
 
     # ── 基础参数 ────────────────────────────────────────────────────────────
@@ -1528,6 +1666,14 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
         args.append("--cpu-moe")
     elif _safe_int(pc.get("n_cpu_moe", 0), 0) > 0 and supports(binary, "--n-cpu-moe"):
         args += ["--n-cpu-moe", str(_safe_int(pc.get("n_cpu_moe"), 0))]
+
+    if qwen38_preset_active:
+        if supports(binary, "--load-mode"):
+            args += ["--load-mode", "mmap"]
+        if supports(binary, "--lazy-mode"):
+            args += ["--lazy-mode", "on"]
+        if supports(binary, "--moe-cache-mib"):
+            args += ["--moe-cache-mib", str(pc["moe_cache_mib"])]
 
     if gpu.get("gpu_plan") and "--fit-target" not in args and supports(binary, "--fit-target"):
         args += ["--fit-target", str(int(tuning["fit_target_mb"]))]

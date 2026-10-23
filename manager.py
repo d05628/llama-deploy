@@ -189,6 +189,8 @@ def default_config():
             "ctx_checkpoints": 32,
             "cpu_moe": False,
             "n_cpu_moe": 0,
+            "qwen38_preset": "off",
+            "qwen38_moe_cache_mib": 0,
         },
         "build": {"use_openblas": True, "jobs": 0},
         "ui": {"language": "zh", "verbose": True},
@@ -2931,6 +2933,21 @@ a{color:var(--primary);text-decoration:none}
             </div>
           </div>
         </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="cfg-qwen38_preset">Qwen3.8 Flash-Next 专属预设</label>
+            <select class="form-input" id="cfg-qwen38_preset">
+              <option value="off">关闭，使用通用配置</option>
+              <option value="fast_quality">高速高质量（主卡 + 自动最大专家缓存）</option>
+            </select>
+            <div class="form-hint">仅针对 Qwen3.8 Flash-Next。主模型放在空闲显存最大的卡，其余显卡承载视觉模块；上下文为 0 时按 65536 启动。启用时自动开启思考模式、使用 f16 KV，并关闭实验性 MTP；不会修改其他模型或保存覆盖通用参数。</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="cfg-qwen38_moe_cache_mib">Qwen3.8 专家缓存 MiB</label>
+            <input class="form-input" id="cfg-qwen38_moe_cache_mib" type="number" min="0" max="32768" step="512" value="0">
+            <div class="form-hint">0 = 自动用满主卡余量（推荐，缓存越大越快）；手动值超出余量时会自动降低，避免显存溢出崩溃。</div>
+          </div>
+        </div>
       </div>
       <div style="display:flex;gap:10px;margin-top:10px">
         <button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button>
@@ -3733,6 +3750,8 @@ async function loadConfig(){
   setVal('cfg-performance_profile',prof);setVal('cfg-fit_target_mb',p.fit_target_mb!=null?p.fit_target_mb:0);
   setVal('cfg-cache_type_k',p.cache_type_k||'auto');setVal('cfg-cache_type_v',p.cache_type_v||'auto');
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
+  setVal('cfg-qwen38_preset',p.qwen38_preset||'off');
+  setVal('cfg-qwen38_moe_cache_mib',p.qwen38_moe_cache_mib!=null?p.qwen38_moe_cache_mib:0);
   renderPresets();
   var bk=document.getElementById('cfg-gpu_backend');if(bk)bk.value=g.backend||'auto';
   setVal('cfg-multi_gpu',g.multi_gpu||'auto');
@@ -3783,6 +3802,8 @@ async function saveConfig(){
   }
   var gpuReserve=Number(getVal('cfg-gpu_reserve_mb'));
   if(!Number.isInteger(gpuReserve)||gpuReserve<0){showToast('每卡预留显存必须是大于等于 0 的整数 MiB',6000);return}
+  var qwen38Cache=Number(getVal('cfg-qwen38_moe_cache_mib'));
+  if(!Number.isInteger(qwen38Cache)||(qwen38Cache!==0&&(qwen38Cache<512||qwen38Cache>32768))){showToast('Qwen3.8 专家缓存须为 0（自动）或 512 到 32768 MiB',6000);return}
   var oldModel=(currentConfig&&currentConfig.model)||{};
   var oldPerf=(currentConfig&&currentConfig.performance)||defaultCfg().performance;
   var oldCompat=(currentConfig&&currentConfig.compat)||defaultCfg().compat;
@@ -3795,6 +3816,8 @@ async function saveConfig(){
   oldPerf.cache_type_k=getVal('cfg-cache_type_k')||'auto';
   oldPerf.cache_type_v=getVal('cfg-cache_type_v')||'auto';
   oldPerf.n_cpu_moe=getNum('cfg-n_cpu_moe',0);
+  oldPerf.qwen38_preset=getVal('cfg-qwen38_preset')||'off';
+  oldPerf.qwen38_moe_cache_mib=qwen38Cache;
   oldPerf.kv_unified=document.getElementById('cfg-kv_unified').classList.contains('on');
   var cfg={
     model:{repo_id:getVal('cfg-repo_id'),model_file:getVal('cfg-model_file'),

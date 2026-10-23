@@ -76,6 +76,7 @@ class MultiGpuPlanningTests(unittest.TestCase):
         plan = multi_gpu.build_plan(engine_inventory(), {}, 14000, 1000)
         self.assertTrue(plan["use_multi_gpu"])
         self.assertTrue(plan["model_fits"])
+        self.assertFalse(plan["tensor_split_explicit"])
         self.assertGreater(plan["tensor_split"][0], plan["tensor_split"][1])
         self.assertAlmostEqual(sum(plan["tensor_split"]), 1)
 
@@ -89,6 +90,7 @@ class MultiGpuPlanningTests(unittest.TestCase):
     def test_custom_split_checks_each_card_not_total_vram(self):
         plan = multi_gpu.build_plan(engine_inventory(), {"multi_gpu": "force", "tensor_split": "1,9"}, 14000)
         self.assertFalse(plan["model_fits"])
+        self.assertTrue(plan["tensor_split_explicit"])
         self.assertLess(plan["payload_capacity_mb"], 7000)
         for split in ("1", "-1,2", "nan,2", "inf,2", "0,0", "bad,2"):
             with self.subTest(split=split), self.assertRaises(ValueError):
@@ -161,14 +163,39 @@ class MultiGpuPlanningTests(unittest.TestCase):
             multi_gpu.launch_args(plan, "--device --main-gpu")
         flags = multi_gpu.launch_args(plan, "--device --main-gpu --split-mode --tensor-split")
         self.assertEqual(flags[flags.index("--device") + 1], "CUDA0,CUDA1")
+        self.assertNotIn("--tensor-split", flags)
         self.assertNotIn("tensor-parallel", " ".join(flags))
+
+    def test_single_card_plan_reports_spare_cards_with_their_budget(self):
+        plan = multi_gpu.build_plan(engine_inventory(), {"multi_gpu": "off", "reserve_mb": 512}, 4000)
+        self.assertFalse(plan["use_multi_gpu"])
+        self.assertEqual(len(plan["spare_devices"]), 1)
+        spare = plan["spare_devices"][0]
+        self.assertNotEqual(spare["device"], plan["device_names"][0])
+        self.assertEqual(spare["payload_budget_mb"], multi_gpu.available_mb(spare) - 512 - 600)
+        forced = multi_gpu.build_plan(engine_inventory(), {"multi_gpu": "force"}, 4000)
+        self.assertEqual(forced["spare_devices"], [])
+
+    def test_manual_split_is_preserved_but_auto_split_is_left_to_engine(self):
+        help_text = "--device --main-gpu --split-mode --tensor-split"
+        automatic = multi_gpu.build_plan(engine_inventory(), {"multi_gpu": "force"}, 14000)
+        custom = multi_gpu.build_plan(engine_inventory(),
+                                      {"multi_gpu": "force", "tensor_split": "1,2"}, 14000)
+        self.assertNotIn("--tensor-split", multi_gpu.launch_args(automatic, help_text))
+        args = multi_gpu.launch_args(custom, help_text)
+        self.assertIn("--tensor-split", args)
+        self.assertEqual(args[args.index("--tensor-split") + 1], "0.33333333,0.66666667")
 
     def test_benchmark_uses_slashes_from_advertised_option_syntax(self):
         plan = multi_gpu.build_plan(engine_inventory(), {"multi_gpu": "force"}, 8000)
         help_text = "--device <dev0/dev1/...>\n--tensor-split <ts0/ts1/..>\n--main-gpu <i>\n--split-mode <none|layer|row>"
         args = multi_gpu.launch_args(plan, help_text)
         self.assertEqual(args[args.index("--device") + 1], "CUDA0/CUDA1")
-        self.assertIn("/", args[args.index("--tensor-split") + 1])
+        self.assertNotIn("--tensor-split", args)
+        manual = multi_gpu.build_plan(engine_inventory(),
+                                      {"multi_gpu": "force", "tensor_split": "1,2"}, 8000)
+        manual_args = multi_gpu.launch_args(manual, help_text)
+        self.assertIn("/", manual_args[manual_args.index("--tensor-split") + 1])
 
     def test_invalid_reserve_and_mode_are_rejected(self):
         for config in ({"reserve_mb": -1}, {"reserve_mb": "nan"}, {"multi_gpu": "maybe"}, {"split_mode": "tensor"}):

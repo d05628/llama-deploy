@@ -181,7 +181,11 @@ def build_plan(devices, config, weights_mb=0.0, kv_mb=0.0, extra_mb=0.0, reserve
                 primary_index=primary.get("index"), primary_uuid=primary.get("uuid", ""),
                 devices=[dict(item, payload_budget_mb=budget) for item, budget in zip(selected, budgets)],
                 device_names=selected_names, engine_device_names=engine_names,
-                tensor_split=shares if multi else [], payload_capacity_mb=capacity,
+                tensor_split=shares if multi else [], tensor_split_explicit=bool(multi and custom),
+                payload_capacity_mb=capacity,
+                # Cards left out of the split can still host small side models.
+                spare_devices=[dict(item, payload_budget_mb=max(0.0, available_mb(item) - reserve - 600))
+                               for item in devices if item not in selected],
                 model_fits=bool(weights_mb > 0 and required <= capacity))
     if multi:
         plan["notes"].append("逐卡扣除预留和运行开销后分配权重；多卡可减少 CPU 卸载，但 PCIe 通信可能降低速度，需实测")
@@ -215,7 +219,9 @@ def launch_args(plan, help_text):
         validate_row_devices(plan["device_names"], plan.get("engine_device_names", []))
     required = ["--device"]
     if plan["use_multi_gpu"]:
-        required += ["--split-mode", "--tensor-split", "--main-gpu"]
+        required += ["--split-mode", "--main-gpu"]
+        if plan.get("tensor_split_explicit"):
+            required.append("--tensor-split")
     if any(flag not in help_text for flag in required):
         raise ValueError("当前引擎缺少可靠的多显卡选择/分配参数，请升级引擎或使用单卡环境")
     # llama-bench uses '/' within one device/split configuration, reserving
@@ -227,6 +233,6 @@ def launch_args(plan, help_text):
         args += ["--split-mode", plan["split_mode"]]
     if "--main-gpu" in help_text:
         args += ["--main-gpu", str(plan["main_gpu"])]
-    if plan["use_multi_gpu"]:
+    if plan["use_multi_gpu"] and plan.get("tensor_split_explicit"):
         args += ["--tensor-split", split_separator.join(f"{value:.8g}" for value in plan["tensor_split"])]
     return args

@@ -87,6 +87,16 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertTrue(agents.workspace_warning(Path(Path.home().anchor)))
         self.assertEqual(agents.workspace_warning(agents.default_workspace()), "")
 
+    def test_remembered_legacy_workspace_falls_back_to_the_new_default(self):
+        # 网页把旧默认目录记在浏览器里；目录搬走后点 agent 不能报"工作目录不存在"
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "workspace"
+            with mock.patch.object(agents, "default_workspace", return_value=new),                     mock.patch.object(agents, "legacy_workspace", return_value=Path(tmp) / "gone"):
+                self.assertEqual(agents.validate_cwd(str(Path(tmp) / "gone")), new.resolve())
+                self.assertTrue(new.is_dir())
+                with self.assertRaises(ValueError):
+                    agents.validate_cwd(str(Path(tmp) / "typo"))
+
     def test_default_workspace_is_inside_the_project_and_isolated_from_its_repo(self):
         workspace = agents.default_workspace()
         self.assertEqual(workspace.parent, agents.PROJECT_DIR)

@@ -291,12 +291,17 @@ def workspace_warning(path: Path) -> str:
     return ""
 
 
+def legacy_workspace() -> Path:
+    """1.6.0 及更早的默认工作目录；网页会在浏览器里记住它，搬走后不能再报"不存在"。"""
+    return Path.home() / "llama-agent-workspace"
+
+
 def validate_cwd(cwd: str) -> Path:
-    if not (cwd or "").strip():
+    path = Path(os.path.expanduser(cwd)).resolve() if (cwd or "").strip() else None
+    if path is None or (not path.exists() and path in (legacy_workspace().resolve(), default_workspace().resolve())):
         path = default_workspace()
         path.mkdir(parents=True, exist_ok=True)
         return path.resolve()
-    path = Path(os.path.expanduser(cwd)).resolve()
     if not path.is_dir():
         raise ValueError(f"工作目录不存在: {path}")
     if _UNSAFE_CHARS & set(str(path)):

@@ -1574,7 +1574,8 @@ class DeployManager:
                   "install": info["install"],
                   "launcher": str(agents_launcher_path(key))} for key, info in agents.AGENTS.items()]
         return {"agents": items, "state": dict(self.agent_state),
-                "default_cwd": str(agents.default_workspace()), "home": str(Path.home())}
+                "default_cwd": str(agents.default_workspace()), "legacy_cwd": str(agents.legacy_workspace()),
+                "home": str(Path.home())}
 
     def launch_agent(self, agent: str, cwd: str, vision: bool = False) -> dict:
         if agent not in agents.AGENTS:
@@ -3907,6 +3908,8 @@ async function loadAgents(){
     var norm=function(p){return String(p||'').replace(/[\\/]+$/,'').toLowerCase()};
     // 旧版默认是整个用户目录（会被浏览器记住）：agent 在里面会扫描/快照所有文件，换成专用工作目录
     if(norm(saved)===norm(r.home)||/^[a-z]:[\\/]?$/i.test(saved))saved='';
+    // 默认工作目录已从用户目录搬到项目内的 workspace/，浏览器记住的旧默认路径不再存在
+    if(r.legacy_cwd&&norm(saved)===norm(r.legacy_cwd)){saved='';try{localStorage.removeItem('agentCwd')}catch(e){}}
     cwd.value=saved||r.default_cwd||''}
   box.style.display='grid';box.style.gridTemplateColumns='repeat(auto-fit,minmax(260px,1fr))';
   box.innerHTML=r.agents.map(function(a){

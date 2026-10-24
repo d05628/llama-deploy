@@ -19,6 +19,10 @@
 
 ### 修复
 
+- **多卡时 agent 模式不再无条件关掉 MTP**：agent 模式原先总是换成 ngram + q4 KV，这是为单张 16GB 卡
+  让出上下文的取舍。几张卡合计放得下"含 MTP 的权重 + 64K 的 q8 KV"时，现在保留 MTP 与 q8 KV、
+  上下文至少 64K，并自动跨卡。RTX 5060 Ti + 3060 Ti 实测 Qwen3.8-27B：Q4_K_M 15.1 → 31.9 tok/s（91K 上下文），
+  IQ4_XS 26.0 → 33.8 tok/s，上下文 67K → 130K。单卡仍按原策略。
 - **重启电脑后双击 agent 启动器，Codex 一直 "Reconnecting... waiting for network"**：启动器只设置环境变量，
   兼容网关原本由 Web 管理器启动，重启后没人拉起它。启动器现在先运行 `compat.py start`（已在运行时立即返回）。
 - **Codex 每轮只说一句话就停下，要人说"继续"**：Codex 交互界面不认 `config.toml` 里的 `model`，

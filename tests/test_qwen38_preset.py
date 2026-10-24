@@ -125,5 +125,29 @@ class Qwen38CacheSizingTests(unittest.TestCase):
         self.assertEqual(cache, 7936)
 
 
+
+class AgentOverrideTests(unittest.TestCase):
+    meta = {"block_count": 65, "nextn_predict_layers": 1, "attention.head_count_kv": 4,
+            "attention.key_length": 256, "attention.value_length": 256, "full_attention_interval": 4}
+
+    def decide(self, frees, multi="auto", weights=15009.0):
+        gpu = {"selected_backend": "cuda",
+               "gpus": [{"vram_mb": 16384, "vram_free_mb": f} for f in frees]}
+        with mock.patch.object(run, "has_mtp_head", return_value=True),                 mock.patch.object(run, "gpu_weight_mb", return_value=weights):
+            return run.agent_overrides(Path("Qwen3.8-27B-Q4_K_M.gguf"), self.meta, gpu,
+                                       {"multi_gpu": multi, "reserve_mb": 512})
+
+    def test_two_cards_keep_mtp_with_long_context(self):
+        overrides, note = self.decide([15057, 8024])
+        self.assertEqual(overrides["spec_type"], "draft-mtp")
+        self.assertEqual(overrides["cache_type_k"], "q8_0")
+        self.assertEqual(overrides["min_ctx_size"], run.AGENT_MIN_CTX)
+        self.assertIn("MTP", note)
+
+    def test_single_card_or_disabled_multi_gpu_keeps_context_first_overrides(self):
+        for frees, multi in (([15057], "auto"), ([15057, 8024], "off"), ([15057, 1200], "auto")):
+            with self.subTest(frees=frees, multi=multi):
+                self.assertEqual(self.decide(frees, multi), (run.AGENT_OVERRIDES, None))
+
 if __name__ == "__main__":
     unittest.main()

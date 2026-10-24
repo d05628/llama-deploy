@@ -1225,6 +1225,32 @@ def _safe_int_min(val, default: int, minimum: int) -> int:
 # 去掉 MTP（草稿层与循环状态拷贝约占 1GB）并用 q4 KV，16GB 卡上自动上下文约 8.8 万；
 # ngram 推测解码无损、不占显存，agent 复读/改写代码时命中率高。
 AGENT_OVERRIDES = {"spec_type": "ngram", "cache_type_k": "q4_0", "cache_type_v": "q4_0"}
+AGENT_MIN_CTX = 65536
+
+
+def agent_overrides(model, meta, gpu, gc) -> tuple:
+    """Keep MTP for agents when the visible cards together hold it with a long context.
+
+    The single-card trade above does not hold across cards: Qwen3.8-27B
+    Q4_K_M on RTX 5060 Ti + 3060 Ti ran 15.1 t/s with ngram + q4 KV but
+    31.8 t/s with MTP + q8 KV at 91K context. MTP draft buffers ~1GB.
+    """
+    devices = gpu.get("gpus", [])
+    if (gpu.get("selected_backend") != "cuda" or len(devices) < 2
+            or str(gc.get("multi_gpu", "auto")).lower() == "off"
+            or not has_mtp_head(model) or is_qwen38_flash_next(model, meta)):
+        return AGENT_OVERRIDES, None
+    try:
+        reserve = multi_gpu.configured_reserve(gc)
+    except ValueError:
+        return AGENT_OVERRIDES, None
+    budget = sum(max(0.0, multi_gpu.available_mb(item) - reserve - 600) for item in devices)
+    need = gpu_weight_mb(model, meta, True) + kv_cache_mb(meta, AGENT_MIN_CTX, "q8_0", "q8_0") + 1024
+    if budget < need:
+        return AGENT_OVERRIDES, None
+    return ({"spec_type": "draft-mtp", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+             "min_ctx_size": AGENT_MIN_CTX},
+            f"agent 模式：多卡显存足够（{budget / 1024:.1f}GB ≥ {need / 1024:.1f}GB），保留 MTP 与 q8 KV，上下文至少 {AGENT_MIN_CTX}")
 
 
 def qwen38_launch_overrides(binary, model, meta, mode, sc, gc, pc):
@@ -1322,7 +1348,6 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     mc  = cfg.get("model", {})
     pc  = cfg.get("performance", {})
     if agent:
-        pc = {**pc, **AGENT_OVERRIDES}
         sc = {**sc, "ctx_size": 0}
 
     model = resolve_model(MODELS_DIR / mc.get("model_file", ""), mc)
@@ -1348,6 +1373,11 @@ def runtime(cfg: dict, mode: str, vision=False, agent=False) -> dict:
     )
     meta = gguf_meta(model)
     warn = []
+    if agent:
+        overrides, agent_note = agent_overrides(model, meta, gpu, gc)
+        pc = {**pc, **overrides}
+        if agent_note:
+            warn.append(agent_note)
     sc, gc, pc, qwen38_preset_active, preset_notes = qwen38_launch_overrides(
         binary, model, meta, mode, sc, gc, pc)
     warn.extend(preset_notes)

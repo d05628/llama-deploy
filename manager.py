@@ -787,6 +787,26 @@ def read_server_mode() -> dict:
         return {}
 
 
+def bench_reports(limit: int = 6) -> dict:
+    """最近几次 agent_bench 的分数（workspace/bench/<时间>/results.json），给网页展示。"""
+    root = agents.default_workspace() / "bench"
+    runs = sorted((d for d in root.glob("2*") if (d / "results.json").is_file()), reverse=True)[:limit]
+    reports = []
+    for run_dir in runs:
+        try:
+            results = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        try:
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}  # 1.6.1 之前的报告没有记录模型和引擎
+        keep = ("agent", "task", "title", "passed", "total", "minutes", "timed_out")
+        reports.append({"id": run_dir.name, "meta": meta, "report": str(run_dir / "report.md"),
+                        "results": [{k: r.get(k) for k in keep} for r in results if isinstance(r, dict)]})
+    return {"reports": reports, "agent_names": {k: v["name"] for k, v in agents.AGENTS.items()}}
+
+
 def agents_launcher_path(agent: str) -> Path:
     return BASE_DIR / "agents" / (f"launch-{agent}.cmd" if platform.system() == "Windows" else f"launch-{agent}.sh")
 
@@ -1515,7 +1535,7 @@ class DeployManager:
         self.deploy_log = []
         self.is_deploying = False
 
-    def _start_task(self, command: list, start_message: str):
+    def _start_task(self, command: list, start_message: str, env: dict = None, cwd: Path = BASE_DIR):
         if self.is_deploying:
             return {"status": "error", "message": "已有任务在运行，请等待当前任务完成"}
         self.deploy_log = []
@@ -1523,14 +1543,14 @@ class DeployManager:
 
         def _run():
             try:
-                env = os.environ.copy()
-                env["PYTHONIOENCODING"] = "utf-8"
+                task_env = dict(env or os.environ)
+                task_env["PYTHONIOENCODING"] = "utf-8"
                 if sys.platform == "win32":
-                    env["PYTHONUTF8"] = "1"
+                    task_env["PYTHONUTF8"] = "1"
                 proc = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    cwd=str(BASE_DIR), env=env,
+                    cwd=str(cwd), env=task_env,
                 )
                 self.deploy_process = proc
                 for raw_line in iter(proc.stdout.readline, b''):
@@ -1568,6 +1588,23 @@ class DeployManager:
             [sys.executable, str(BASE_DIR / "deploy.py"), "--upgrade-llama"],
             "llama.cpp 升级已启动"
         )
+
+    def strata_info(self) -> dict:
+        if not strata_engine.installed():
+            return {"status": "ok", "installed": False}
+        cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
+        info = strata_engine.update_check(cfg)
+        return {"status": "ok", "installed": True, **info}
+
+    def upgrade_strata(self):
+        if not strata_engine.installed():
+            return {"status": "error", "message": "尚未安装 Strata：在配置里选 Strata 引擎并启动一次服务即可自动安装"}
+        if read_server_mode().get("engine") == "strata" and self.get_server_status().get("server_running"):
+            return {"status": "error", "message": "请先停止服务器，再升级 Strata"}
+        cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
+        # Strata 先试启动新引擎，失败自动保留旧版本
+        return self._start_task(strata_engine.command("update"), "Strata 升级已启动",
+                                env=strata_engine.environment(cfg), cwd=strata_engine.CONTROL_DIR)
 
     # ---------- 一键启动 agent（Claude Code / Codex / Gemini CLI） ----------
     agent_state = {"agent": "", "state": "idle", "message": ""}
@@ -2257,6 +2294,10 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             self._json_resp(deploy_mgr.list_agents())
         elif path == "/api/llama/info":
             self._json_resp(get_engine_info(params.get("latest", "1") != "0"))
+        elif path == "/api/strata/info":
+            self._json_resp(deploy_mgr.strata_info())
+        elif path == "/api/bench/reports":
+            self._json_resp(bench_reports())
         elif path == "/api/deploy/log":
             since = int(params.get("since", "0"))
             self._json_resp(deploy_mgr.get_deploy_log(since))
@@ -2395,6 +2436,8 @@ class APIHandler(http.server.SimpleHTTPRequestHandler):
             self._json_resp(deploy_mgr.start_deploy())
         elif path == "/api/llama/update":
             self._json_resp(deploy_mgr.upgrade_llama())
+        elif path == "/api/strata/update":
+            self._json_resp(deploy_mgr.upgrade_strata())
         elif path == "/api/llama/rollback":
             self._json_resp(deploy_mgr.rollback_llama())
         elif path == "/api/agents/close":
@@ -3017,6 +3060,15 @@ a{color:var(--primary);text-decoration:none}
         </div>
       </div>
       <div class="card">
+        <div class="card-title">🧩 推理引擎（Strata，Qwen3.8 Flash-Next）</div>
+        <div id="strataContent">加载中...</div>
+        <div class="form-hint">从 Strata 官方签名更新源升级引擎与控制程序；新引擎先试启动，失败自动保留当前版本。
+          首次使用请在「配置」里把推理引擎选为 Strata 并启动一次服务，会自动安装。</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+          <button class="btn btn-primary" onclick="upgradeStrata()" id="btnUpgradeStrata" disabled>⬆️ 一键升级 Strata</button>
+        </div>
+      </div>
+      <div class="card">
         <div class="card-title">🤖 一键启动 Agent（本地模型）</div>
         <div class="form-hint">自动启动模型服务与兼容网关，并在新窗口打开所选工具。只对这个窗口生效、使用独立配置目录，
           不改动官方配置和登录；平时直接运行 claude / codex / gemini 等仍走官方通道。
@@ -3035,6 +3087,12 @@ a{color:var(--primary);text-decoration:none}
         <div style="margin-top:10px">
           <button class="btn btn-ghost" onclick="closeAgents()">⏹️ 关闭 agent 窗口并释放显存</button>
         </div>
+        <details style="margin-top:14px" ontoggle="if(this.open)loadBench()">
+          <summary style="cursor:pointer;font-weight:600">📊 测试题组结果（最近几次 agent_bench）</summary>
+          <div class="form-hint" style="margin:6px 0">分数是自动检查通过的项数；每次运行的完整明细在对应目录的 report.md。
+            运行：<code>python agent_bench/run_bench.py</code></div>
+          <div id="benchContent">加载中...</div>
+        </details>
       </div>
       <div class="card">
         <div class="card-title">🌐 局域网与兼容网关</div>
@@ -3151,7 +3209,7 @@ async function init(){
   renderHardwareSummary();
   await loadDefaultCfg();
   await loadConfig();
-  pollStatus();loadEngineInfo();loadAgents();
+  pollStatus();loadEngineInfo();loadStrataInfo();loadAgents();
   // 支持 #deploy 这类地址直接打开对应页面（可收藏）
   var hashPage=location.hash.replace('#','');
   if(hashPage&&document.getElementById('page-'+hashPage)){
@@ -3995,6 +4053,67 @@ async function rollbackLlama(){
   startLogPoll();
 }
 
+async function loadBench(){
+  var box=document.getElementById('benchContent');if(!box)return;
+  var r=await api('/api/bench/reports');
+  if(!r||!r.reports){box.textContent='无法读取测试结果';return}
+  if(!r.reports.length){box.innerHTML='<span class="form-hint">还没有测试结果</span>';return}
+  var names=r.agent_names||{};
+  box.innerHTML=r.reports.map(function(rep){
+    var m=rep.meta||{},id=rep.id||'';
+    var when=id.length>=15?id.slice(0,4)+'-'+id.slice(4,6)+'-'+id.slice(6,8)+' '+id.slice(9,11)+':'+id.slice(11,13):id;
+    var info=m.model?esc(m.model)+' · '+esc(m.engine||'')+' · 上下文 '+esc(String(m.n_ctx||'')):'（这次运行未记录模型与引擎）';
+    var agentsOrder=[],tasks=[];
+    rep.results.forEach(function(x){if(agentsOrder.indexOf(x.agent)<0)agentsOrder.push(x.agent);
+      if(!tasks.some(function(t){return t.task===x.task}))tasks.push({task:x.task,title:x.title})});
+    var head='<tr><th style="text-align:left">agent</th>'+tasks.map(function(t){return '<th style="text-align:left">'+esc(t.title)+'</th>'}).join('')+'</tr>';
+    var rows=agentsOrder.map(function(a){
+      return '<tr><td>'+esc(names[a]||a)+'</td>'+tasks.map(function(t){
+        var x=rep.results.filter(function(y){return y.agent===a&&y.task===t.task})[0];
+        if(!x)return '<td class="form-hint">—</td>';
+        var ok=x.passed===x.total;
+        return '<td><span class="tag '+(ok?'tag-green':'tag-red')+'">'+x.passed+'/'+x.total+'</span> '+esc(String(x.minutes))+' 分钟'+(x.timed_out?' · 超时':'')+'</td>';
+      }).join('')+'</tr>';
+    }).join('');
+    return '<div style="margin:12px 0"><div style="font-weight:600">'+esc(when)+'</div><div class="form-hint">'+info+'</div>'+
+      '<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;margin-top:6px">'+head+rows+'</table></div>'+
+      '<div class="form-hint">'+esc(rep.report)+'</div></div>';
+  }).join('');
+}
+
+async function loadStrataInfo(){
+  var box=document.getElementById('strataContent');if(!box)return;
+  var btn=document.getElementById('btnUpgradeStrata');
+  var r=await api('/api/strata/info');
+  if(!r||r.status==='error'){box.textContent='无法读取 Strata 信息';return}
+  if(!r.installed){box.innerHTML='<span class="form-hint">未安装</span>';if(btn)btn.disabled=true;return}
+  if(r.error){box.innerHTML='<span class="form-hint">'+esc(r.error)+'</span>';if(btn)btn.disabled=false;return}
+  var tag=r.update_available?' <span class="tag tag-green">可升级</span>':' <span class="tag tag-blue">已是最新</span>';
+  var v=function(a,b){return esc(a||'未安装')+(b&&b!==a?' → '+esc(b):'')};
+  box.innerHTML=
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">'+
+    '<div class="form-group"><div class="form-label">引擎</div><div style="font-weight:600">'+v(r.engine,r.engine_offered)+(r.engine_variant?' · '+esc(r.engine_variant):'')+'</div></div>'+
+    '<div class="form-group"><div class="form-label">控制程序</div><div style="font-weight:600">'+v(r.control,r.control_offered)+'</div></div>'+
+    '<div class="form-group"><div class="form-label">状态</div><div style="font-weight:600">'+tag+'</div></div>'+
+    '</div>';
+  if(btn)btn.disabled=false;
+}
+
+async function upgradeStrata(){
+  var st=await api('/api/status');
+  if(st&&st.server_running&&st.server_engine==='strata'){showToast('请先停止服务器，再升级 Strata', 6000);return}
+  if(!confirm('从 Strata 官方签名更新源升级引擎与控制程序？\n新引擎会先试启动，失败自动保留当前版本。'))return;
+  document.getElementById('btnUpgradeStrata').disabled=true;
+  logLineCount=0;document.getElementById('deployLog').textContent='⬆️ 开始升级 Strata...\n';
+  var r=await api('/api/strata/update','POST');
+  if(r&&r.status==='error'){
+    showToast(r.message||'启动升级失败', 8000);
+    document.getElementById('btnUpgradeStrata').disabled=false;
+    return;
+  }
+  startLogPoll();
+}
+
 async function upgradeLlama(){
   var st=await api('/api/status');
   if(st&&st.server_running){showToast('请先停止服务器，再升级 llama.cpp', 6000);return}
@@ -4029,7 +4148,7 @@ function startLogPoll(){
     if(!data.running){clearInterval(logPollTimer);logPollTimer=null;
       document.getElementById('btnDeploy').disabled=false;
       var up=document.getElementById('btnUpgradeLlama');if(up)up.disabled=false;
-      pollStatus();loadEngineInfo();}
+      pollStatus();loadEngineInfo();loadStrataInfo();}
   },1000);
 }
 

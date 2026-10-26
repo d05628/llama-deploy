@@ -72,8 +72,21 @@ def ensure_server():
             except Exception:
                 time.sleep(2)
     subprocess.run([sys.executable, str(BASE / "compat.py"), "start"], capture_output=True)
-    props = json.loads(urllib.request.urlopen(SERVER + "/props", timeout=10).read())
-    return int(props["default_generation_settings"]["n_ctx"])
+    # Strata answers /health while it loads but /props only once the model is ready
+    for _ in range(180):
+        try:
+            return json.loads(urllib.request.urlopen(SERVER + "/props", timeout=10).read())
+        except Exception:
+            time.sleep(2)
+    raise RuntimeError("模型服务没有就绪（/props 无响应）")
+
+
+def server_info(props: dict) -> dict:
+    """What the report was measured on, so runs on different models or engines are not compared blindly."""
+    return {"n_ctx": int(props["default_generation_settings"]["n_ctx"]),
+            "model": Path(str(props.get("model_path") or "")).name or str(props.get("model_alias") or ""),
+            "engine": str(props.get("build_info") or "llama.cpp"),
+            "vision": bool((props.get("modalities") or {}).get("vision"))}
 
 
 class Thermal:
@@ -212,12 +225,14 @@ def run_one(agent: str, task_id: str, root: Path, n_ctx: int) -> dict:
             **thermal.stop()}
 
 
-def write_report(root: Path, results: list, n_ctx: int):
+def write_report(root: Path, results: list, server: dict):
     (root / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / "meta.json").write_text(json.dumps(server, ensure_ascii=False, indent=2), encoding="utf-8")
     agents_order = list(dict.fromkeys(r["agent"] for r in results))
     tasks_order = list(dict.fromkeys(r["task"] for r in results))
     lines = [f"# agent 测试报告 {root.name}", "",
-             f"模型服务：agent 模式 + 看图，上下文 {n_ctx}。分数为自动检查通过项数。", "",
+             f"模型：{server['model']} · 引擎：{server['engine']} · agent 模式"
+             f"{' + 看图' if server['vision'] else ''}，上下文 {server['n_ctx']}。分数为自动检查通过项数。", "",
              "| agent | " + " | ".join(TASKS[t]["title"] for t in tasks_order) + " |",
              "|---|" + "---|" * len(tasks_order)]
     for a in agents_order:
@@ -252,8 +267,9 @@ def main():
     args = ap.parse_args()
     root = Path(args.out) / datetime.now().strftime("%Y%m%d-%H%M%S")
     root.mkdir(parents=True, exist_ok=True)
-    n_ctx = ensure_server()
-    print(f"结果目录: {root}  上下文: {n_ctx}", flush=True)
+    server = server_info(ensure_server())
+    n_ctx = server["n_ctx"]
+    print(f"结果目录: {root}  模型: {server['model']}  引擎: {server['engine']}  上下文: {n_ctx}", flush=True)
     results = []
     for agent in [a.strip() for a in args.agents.split(",") if a.strip()]:
         for task_id in [t.strip() for t in args.tasks.split(",") if t.strip()]:
@@ -263,7 +279,7 @@ def main():
             r = run_one(agent, task_id, root, n_ctx)
             results.append(r)
             print(f"  {r['passed']}/{r['total']}  {r['minutes']} 分钟{'  超时' if r['timed_out'] else ''}", flush=True)
-            write_report(root, results, n_ctx)
+            write_report(root, results, server)
     print(f"报告: {root / 'report.md'}")
 
 

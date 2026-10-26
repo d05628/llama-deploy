@@ -58,6 +58,26 @@ class StrataLaunchTests(unittest.TestCase):
             self.assertEqual(strata_engine.status(8080), {})
 
 
+class StrataUpdateCheckTests(unittest.TestCase):
+    def check(self, engine_offered, control_offered="0.1.51"):
+        payload = {"ok": True, "engine": {"installed": {"version": "0.1.50", "variant": "cuda13"},
+                                          "offered": {"version": engine_offered}},
+                   "control": {"installed": "0.1.51", "offered": control_offered}}
+        done = mock.Mock(stdout="log line\n" + __import__("json").dumps(payload) + "\n")
+        with mock.patch("subprocess.run", return_value=done):
+            return strata_engine.update_check({})
+
+    def test_versions_are_compared_to_decide_whether_to_offer_an_upgrade(self):
+        self.assertFalse(self.check("0.1.50")["update_available"])
+        self.assertTrue(self.check("0.1.52")["update_available"])
+        self.assertTrue(self.check("0.1.50", "0.1.53")["update_available"])
+        self.assertEqual(self.check("0.1.50")["engine_variant"], "cuda13")
+
+    def test_unreadable_output_is_reported_not_raised(self):
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="")):
+            self.assertIn("error", strata_engine.update_check({}))
+
+
 class EngineSelectionTests(unittest.TestCase):
     def pick(self, engine, flash_next=True, available=True):
         cfg = {"server": {"engine": engine}, "model": {"model_file": "m.gguf"}}

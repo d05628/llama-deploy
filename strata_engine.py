@@ -147,6 +147,28 @@ def stop(cfg: dict, timeout: int = 240) -> str:
     return (r.stdout or r.stderr or "").strip()
 
 
+def update_check(cfg: dict) -> dict:
+    """Installed and offered engine / control versions from Strata's signed update feed."""
+    try:
+        r = subprocess.run(command("update", "--check", "--output", "json"), env=environment(cfg),
+                           cwd=str(CONTROL_DIR), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=90)
+        data = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception as exc:
+        return {"error": f"无法读取 Strata 更新信息: {exc}"}
+    if not data.get("ok", True):
+        return {"error": str(data.get("error") or "Strata 更新检查失败")}
+    engine, control = data.get("engine") or {}, data.get("control") or {}
+    info = {"engine": (engine.get("installed") or {}).get("version"),
+            "engine_offered": (engine.get("offered") or {}).get("version"),
+            "engine_variant": (engine.get("installed") or {}).get("variant"),
+            "control": control.get("installed"), "control_offered": control.get("offered")}
+    info["update_available"] = any(
+        offered and offered != current for current, offered in
+        ((info["engine"], info["engine_offered"]), (info["control"], info["control_offered"])))
+    return info
+
+
 def launcher_running(pid: int) -> bool:
     """The `strata launch` process stays alive while it downloads, prepares and loads, then exits once serving."""
     if not pid:

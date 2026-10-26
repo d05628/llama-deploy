@@ -24,6 +24,7 @@
   "server": {
     "host": "0.0.0.0",
     "port": 8080,
+    "engine": "llama.cpp",   // 或 "strata"：仅对 Qwen3.8 Flash-Next 生效，其余模型仍用 llama.cpp
     "threads": 0,
     "ctx_size": 0,
     "enable_thinking": false,

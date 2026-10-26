@@ -304,6 +304,26 @@ python run.py status
 
 若更新器提示所选预编译包低于 CUDA 12.8，它仍可兼容运行，但没有 `sm_120` 原生构建优化；高级用户可安装 CUDA Toolkit 12.8+、CMake 和 Visual Studio C++ 工具链后运行 `python deploy.py --build-from-source`。该操作同样会先备份旧引擎，并在构建或验证失败时自动回滚。
 
+### Strata 引擎（Qwen3.8 Flash-Next）
+
+[Strata](https://github.com/Niko1221/Strata)（MIT）是专为 Flash-Next 做的推理引擎。在 Web 管理器「配置」里把**推理引擎**选成 Strata，或在 `config.jsonc` 的 `server` 里写 `"engine": "strata"`；只有 Flash-Next 会改用它，其他模型照常走 llama.cpp。启动、停止、一键 agent 和兼容网关的用法都不变（Strata 同样监听 `server.port`，网关原样转发）。
+
+- **首次启动**会下载固定版本的 Strata 终端（v0.2.6，按仓库里写死的 SHA-256 校验）、引擎（约 580MB）和 MTP 草稿层（约 5GB），并为模型做一次性准备。已下载的 ISTA-DASLab 模型文件原地使用，不会复制。
+- **文件位置**：程序在 `engines/strata`，引擎与运行状态在 `engines/strata-home`（启动时把 `APPDATA`/`LOCALAPPDATA` 指到这里，系统盘不留文件），准备好的数据与草稿层在 `models/strata`。都已被 git 忽略。
+- **双卡**：空闲显存最多的卡作主卡，其余有余量的卡作副卡（`--gpu-roles`）。副卡固定持有一部分专家并就地计算，跨卡只传很小的中间结果，所以 PCIe x4 插槽上的副卡也能提速——这正是 llama.cpp 跨卡变慢的原因。
+- **内存**：专家约 47GB（IQ3_XXS）会读进内存常驻，64GB 机器运行时请少开其他大程序。
+- **看图**：在 GPU 上运行。它的 CPU 版看图模块在 Ryzen 5600 上启动即崩溃（0xC0000005），因此不使用。
+- **访问范围**：Strata 只监听本机；局域网设备请通过兼容网关（默认 11434）访问。
+
+同一台机器（RTX 5060 Ti + 3060 Ti，DDR4-3200）、同一个 IQ3_XXS 模型、64K 上下文实测：
+
+| 引擎 | 吐字 | 3K 提示预填充 |
+|---|---|---|
+| llama.cpp（本项目 Flash-Next 预设） | 24.2 tok/s | 227 tok/s |
+| Strata 0.1.50（主卡 + 副卡，MTP） | 56.6 tok/s | 491 tok/s |
+
+Codex 一次带工具调用的问答（含约 1.3 万 token 系统提示）从约 95 秒缩短到 19 秒。
+
 ### 下载配置
 
 | 参数 | 说明 | 默认 |

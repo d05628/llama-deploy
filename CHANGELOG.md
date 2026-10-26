@@ -6,6 +6,12 @@
 
 ### 新增
 
+- **可选 Strata 引擎运行 Qwen3.8 Flash-Next**：Web 管理器「配置」或 `server.engine = "strata"`。只接管 Flash-Next，
+  其他模型仍用 llama.cpp；启动、停止、一键 agent 与兼容网关用法不变。首次启动下载固定版本 v0.2.6（按写死的 SHA-256 校验）、
+  引擎和 MTP 草稿层，模型文件原地使用；所有文件留在 `engines/` 与 `models/strata`（启动时把 APPDATA/LOCALAPPDATA 指到项目内）。
+  空闲显存最多的卡作主卡，其余作副卡就地计算专家。RTX 5060 Ti + 3060 Ti、IQ3_XXS、64K 上下文实测：
+  吐字 24.2 → 56.6 tok/s，预填充 227 → 491 tok/s；agent 题组 Claude Code / Codex / OpenCode / Aider 的 SVG 与修 bug 全部通过
+  （Codex 修 bug 由 1/3 变为 3/3），Codex 看视频题 4/4。Strata 的 CPU 看图模块在 Ryzen 5600 上启动即崩溃，看图改在 GPU 上运行。
 - **Qwen3.8 Flash-Next「高速高质量」预设**（默认关闭，只对 `qwen4exp` 模型生效）：主模型放在空闲显存最大的卡，
   非专家层全部驻留 GPU，专家留在内存并用 `--moe-cache-mib` 把热点专家缓存到显存，n-gram 表按需映射。
   专家缓存默认自动用满主卡余量——`--cpu-moe` 会让 `--fit` 失效，缓存过大只会在首次推理时 CUDA OOM，

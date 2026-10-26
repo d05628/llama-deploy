@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 import engines
 import multi_gpu
+import strata_engine
 
 if sys.platform == "win32":
     try:
@@ -1815,6 +1816,9 @@ def cmd_chat(cfg: dict) -> int:
 
 
 def cmd_server(cfg: dict, vision=False, agent=False) -> int:
+    if model := strata_model(cfg):
+        # Strata serves in the background on its own; stop it with python run.py stop
+        return cmd_strata_background(cfg, model, vision, agent)
     if leftover := wait_for_vram_release():
         print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
               "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
@@ -1881,7 +1885,63 @@ def cmd_server(cfg: dict, vision=False, agent=False) -> int:
         PID_FILE.unlink(missing_ok=True)
 
 
+def strata_model(cfg: dict):
+    """The Flash-Next model to serve with Strata, or None when this start stays on llama.cpp."""
+    if str((cfg.get("server") or {}).get("engine", "llama.cpp")).strip().lower() != "strata":
+        return None
+    mc = cfg.get("model", {})
+    model = resolve_model(MODELS_DIR / mc.get("model_file", ""), mc)
+    if not model:
+        return None  # runtime() reports the missing file
+    if not is_qwen38_flash_next(model, gguf_meta(model)):
+        print("⚠️  Strata 只支持 Qwen3.8 Flash-Next，当前模型改用 llama.cpp 启动")
+        return None
+    if not strata_engine.available():
+        print("⚠️  Strata 目前只在 Windows 上接入，本次改用 llama.cpp 启动")
+        return None
+    return model
+
+
+def cmd_strata_background(cfg: dict, model: Path, vision=False, agent=False) -> int:
+    """Start `strata launch` detached; it downloads what is missing, loads the model and exits once serving."""
+    if leftover := wait_for_vram_release():
+        print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），请先执行 python run.py stop")
+        return 1
+    try:
+        strata_engine.install(cfg)
+    except Exception as e:
+        print(f"Strata 安装失败: {e}")
+        return 1
+    gpu = accel((cfg.get("gpu") or {}).get("backend", "auto"))
+    args = strata_engine.launch_args(cfg, model, vision, gpu.get("gpus", []))
+    port = _safe_int((cfg.get("server") or {}).get("port"), 8080)
+    print(f"   引擎: Strata ({strata_engine.CONTROL_DIR})")
+    print(f"   模型: {model}")
+    with open(LOG_FILE, "w", encoding="utf-8") as log_f:
+        kwargs = dict(stdout=log_f, stderr=subprocess.STDOUT, cwd=str(strata_engine.CONTROL_DIR),
+                      env=strata_engine.environment(cfg))
+        if IS_WIN:
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(args, **kwargs)
+    PID_FILE.unlink(missing_ok=True)
+    MODE_FILE.write_text(json.dumps({"engine": "strata", "pid": proc.pid, "port": port,
+                                     "vision": bool(vision), "agent": bool(agent)}), encoding="utf-8")
+    time.sleep(3)
+    if proc.poll() is not None and proc.returncode != 0:
+        print(f"Strata 启动失败 (退出码: {proc.returncode})")
+        print(LOG_FILE.read_text(encoding="utf-8", errors="replace")[-800:])
+        return 1
+    print("Strata 正在后台加载模型（首次启动会先下载引擎和草稿层）")
+    print(f"地址: http://localhost:{port}")
+    print(f"日志: {LOG_FILE}")
+    return 0
+
+
 def cmd_server_background(cfg: dict, vision=False, agent=False) -> int:
+    if model := strata_model(cfg):
+        return cmd_strata_background(cfg, model, vision, agent)
     if leftover := wait_for_vram_release():
         print(f"⚠️  已有 llama-server 在运行（PID {', '.join(map(str, leftover))}），它占用的显存会让本次启动"
               "把部分层放到 CPU、速度大幅下降。请先执行 python run.py stop")
@@ -1947,7 +2007,39 @@ def cmd_server_background(cfg: dict, vision=False, agent=False) -> int:
                 pass
 
 
-def cmd_stop() -> int:
+def read_mode() -> dict:
+    try:
+        return json.loads(MODE_FILE.read_text(encoding="utf-8")) if MODE_FILE.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def strata_running(cfg: dict) -> bool:
+    mode = read_mode()
+    if mode.get("engine") != "strata":
+        return False
+    port = _safe_int(mode.get("port") or (cfg.get("server") or {}).get("port"), 8080)
+    return bool(strata_engine.status(port)) or strata_engine.launcher_running(mode.get("pid"))
+
+
+def stop_strata(cfg: dict) -> bool:
+    """Stop the Strata launch this project started; False when none is running."""
+    mode = read_mode()
+    if mode.get("engine") != "strata":
+        return False
+    pid = mode.get("pid")
+    if strata_engine.launcher_running(pid):
+        # still downloading or loading: end the launcher so it does not start serving after the stop
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)] if IS_WIN else ["kill", str(pid)],
+                       capture_output=True)
+    print(strata_engine.stop(cfg) or "已停止 Strata")
+    MODE_FILE.unlink(missing_ok=True)
+    return True
+
+
+def cmd_stop(cfg: dict = None) -> int:
+    if stop_strata(cfg or {}):
+        return 0
     if not PID_FILE.exists():
         print("没有运行中的服务（PID 文件不存在）")
         return 0
@@ -2016,7 +2108,11 @@ def cmd_status(cfg: dict) -> int:
     else:
         capability = f" | CC={gpu['compute_capability']}" if gpu.get("compute_capability") else ""
         print(f"   GPU 后端:      {gpu['selected_backend']} | {gpu.get('name') or gpu['selected_backend'].upper()} | free={gpu.get('vram_free_mb', 0)}MB{capability}")
-    if PID_FILE.exists():
+    if strata_running(cfg):
+        ready = strata_engine.status(_safe_int(sc.get("port"), 8080))
+        print(f"   服务状态:      Strata {'运行中' if ready else '加载中'}")
+        print(f"   地址:          http://localhost:{sc.get('port', 8080)}")
+    elif PID_FILE.exists():
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
         if pid_running(pid, "llama-server"): print(f"   服务状态:      运行中 (PID: {pid})"); print(f"   地址:          http://localhost:{sc.get('port', 8080)}")
         else: print("   服务状态:      未运行 (PID 文件残留)"); PID_FILE.unlink(missing_ok=True)
@@ -2113,7 +2209,7 @@ def main() -> int:
             if "--background" in args or "-bg" in args:
                 return cmd_server_background(cfg, vision, agent)
             return cmd_server(cfg, vision, agent)
-        if args[0].lower() == "stop": return cmd_stop()
+        if args[0].lower() == "stop": return cmd_stop(cfg)
         if args[0].lower() == "status": return cmd_status(cfg)
         if args[0].lower() == "benchmark": return cmd_benchmark(cfg, "--sweep" in args)
         print(f"未知命令: {args[0]}"); print_help(); return 1

@@ -42,6 +42,7 @@ import unicodedata
 
 import agents
 import engines
+import strata_engine
 import multi_gpu
 import urllib.error
 import urllib.parse
@@ -135,6 +136,7 @@ def default_config():
         "server": {
             "host": "0.0.0.0",
             "port": 8080,
+            "engine": "llama.cpp",  # 或 "strata"：仅对 Qwen3.8 Flash-Next 生效
             "threads": 0,         # 0 = run.py 自动计算（物理核数）
             "ctx_size": 0,
             "enable_thinking": False,
@@ -777,6 +779,8 @@ def read_server_mode() -> dict:
     """run.py 启动服务时记录的模式（vision / agent）；PID 对不上说明是过期记录。"""
     try:
         mode = json.loads((BASE_DIR / ".llama-server.mode.json").read_text(encoding="utf-8"))
+        if mode.get("engine") == "strata":
+            return mode  # Strata 不写 PID 文件，由 strata_running() 按端口和启动进程判断
         pid = PID_FILE.read_text(encoding="utf-8").strip() if PID_FILE.exists() else ""
         return mode if str(mode.get("pid")) == pid else {}
     except (OSError, ValueError):
@@ -1625,7 +1629,8 @@ class DeployManager:
                     raise RuntimeError(started.get("message", "模型服务启动失败"))
             step("等待模型加载完成...")
             props = None
-            deadline = time.time() + 600
+            # Strata 首次启动要先下载引擎和约 5GB 的草稿层
+            deadline = time.time() + (3600 if read_server_mode().get("engine") == "strata" else 600)
             while time.time() < deadline:
                 try:
                     with urllib.request.urlopen(f"http://127.0.0.1:{port}/props", timeout=3) as resp:
@@ -1843,6 +1848,12 @@ class DeployManager:
             except Exception:
                 running = False
                 PID_FILE.unlink(missing_ok=True)
+        engine, loading = "llama.cpp", False
+        mode = read_server_mode()
+        if not running and mode.get("engine") == "strata":
+            ready = strata_engine.status(int(mode.get("port") or 8080))
+            if ready or strata_engine.launcher_running(mode.get("pid")):
+                running, engine, loading = True, "strata", not ready
         config = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else {}
         ensure_compat_config(config)
         model_cfg = config.get("model", {})
@@ -1863,6 +1874,8 @@ class DeployManager:
         status = {
             "server_running": running,
             "server_pid": pid if running else None,
+            "server_engine": engine,
+            "server_loading": loading,
             "model_deployed": model_complete,
             "model_exists": model_exists,
             "model_complete": model_complete,
@@ -1908,6 +1921,10 @@ class DeployManager:
             output = result.stdout.decode('utf-8', errors='replace')
             err = result.stderr.decode('utf-8', errors='replace')
 
+            if result.returncode == 0 and read_server_mode().get("engine") == "strata":
+                port = parse_jsonc(CONFIG_FILE).get("server", {}).get("port", 8080)
+                return {"status": "ok",
+                        "message": f"Strata 正在加载模型（首次启动会先下载引擎和草稿层）\n地址: http://localhost:{port}"}
             if result.returncode == 0 and PID_FILE.exists():
                 pid = PID_FILE.read_text().strip()
                 port = parse_jsonc(CONFIG_FILE).get("server", {}).get("port", 8080)
@@ -1938,6 +1955,12 @@ class DeployManager:
             return {"status": "error", "message": f"启动异常: {e}"}
     def stop_server(self):
         killed = False
+        if read_server_mode().get("engine") == "strata":
+            # run.py stop 也会结束仍在下载或加载中的 strata launch 进程
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+            subprocess.run([sys.executable, str(BASE_DIR / "run.py"), "stop"], capture_output=True,
+                           timeout=300, cwd=str(BASE_DIR), env=env)
+            return {"status": "ok", "message": "✅ 已停止 Strata"}
 
         # 方法1：按 PID 文件杀。先确认这个 PID 确实还是 llama-server ——
         # PID 会被系统复用，PID 文件过期时直接 kill 会打到无关进程上。
@@ -2936,6 +2959,16 @@ a{color:var(--primary);text-decoration:none}
         </div>
         <div class="form-row">
           <div class="form-group">
+            <label class="form-label" for="cfg-engine">推理引擎</label>
+            <select class="form-input" id="cfg-engine">
+              <option value="llama.cpp">llama.cpp（所有模型）</option>
+              <option value="strata">Strata（仅 Qwen3.8 Flash-Next，实测快约 2.3 倍）</option>
+            </select>
+            <div class="form-hint">Strata 只接管 Flash-Next，其他模型仍用 llama.cpp。首次启动会下载引擎（约 580MB）和草稿层（约 5GB），全部放在项目目录；运行时专家约 47GB 常驻内存，只监听本机，局域网请通过兼容网关访问。</div>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
             <label class="form-label" for="cfg-qwen38_preset">Qwen3.8 Flash-Next 专属预设</label>
             <select class="form-input" id="cfg-qwen38_preset">
               <option value="off">关闭，使用通用配置</option>
@@ -3752,6 +3785,7 @@ async function loadConfig(){
   setVal('cfg-cache_type_k',p.cache_type_k||'auto');setVal('cfg-cache_type_v',p.cache_type_v||'auto');
   setVal('cfg-n_cpu_moe',p.n_cpu_moe!=null?p.n_cpu_moe:0);
   setVal('cfg-qwen38_preset',p.qwen38_preset||'off');
+  setVal('cfg-engine',s.engine||'llama.cpp');
   setVal('cfg-qwen38_moe_cache_mib',p.qwen38_moe_cache_mib!=null?p.qwen38_moe_cache_mib:0);
   renderPresets();
   var bk=document.getElementById('cfg-gpu_backend');if(bk)bk.value=g.backend||'auto';
@@ -3829,7 +3863,8 @@ async function saveConfig(){
      server:{host:'0.0.0.0',port:serverPort,threads:getNum('cfg-threads',0),
              ctx_size:getNum('cfg-ctx_size',0),
              enable_thinking:document.getElementById('cfg-thinking').classList.contains('on'),
-             reasoning_budget:getNum('cfg-reasoning_budget',512)},
+             reasoning_budget:getNum('cfg-reasoning_budget',512),
+             engine:getVal('cfg-engine')||'llama.cpp'},
      compat:oldCompat,
      gpu:{backend:document.getElementById('cfg-gpu_backend').value||'auto',
          gpu_layers:getNum('cfg-gpu_layers',-1),

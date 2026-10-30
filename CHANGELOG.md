@@ -30,6 +30,7 @@
 
 ### 修复
 
+- **一键升级 Strata 报 `SSL: UNEXPECTED_EOF_WHILE_READING`**：有的网络会掐断 Python（OpenSSL）发起的 TLS 握手，而放行 Windows 自带的 TLS（Schannel）；Strata 用 Python 下载，于是读不到 GitHub 上的更新源。现在先用 curl（Schannel）把签名更新源和本机需要的安装包取到 `engines/strata-feed`，按更新源里的 SHA-256 核对后交给 `strata update --feed <文件夹>`，签名仍由 Strata 校验；取不到时退回 Strata 自己下载，读不到更新源时重试，并依次尝试配置的镜像、GitHub 和内置的 gh-proxy.com。内置镜像只用于 Strata（更新源有签名、安装包哈希固定），不写进 `download.github_mirror`，因为 llama.cpp 经镜像下载不校验哈希。实测从 0.1.50 / 0.1.53 升级到引擎与控制程序 0.1.54 成功；同一时间对比两个引擎，IQ3_XXS 吐字 44.0 / 45.3 tok/s，没有退步。
 - **多卡时 agent 模式不再无条件关掉 MTP**：agent 模式原先总是换成 ngram + q4 KV，这是为单张 16GB 卡
   让出上下文的取舍。几张卡合计放得下"含 MTP 的权重 + 64K 的 q8 KV"时，现在保留 MTP 与 q8 KV、
   上下文至少 64K，并自动跨卡。RTX 5060 Ti + 3060 Ti 实测 Qwen3.8-27B：Q4_K_M 15.1 → 31.9 tok/s（91K 上下文），

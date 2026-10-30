@@ -64,7 +64,7 @@ class StrataUpdateCheckTests(unittest.TestCase):
                                           "offered": {"version": engine_offered}},
                    "control": {"installed": "0.1.51", "offered": control_offered}}
         done = mock.Mock(stdout="log line\n" + __import__("json").dumps(payload) + "\n")
-        with mock.patch("subprocess.run", return_value=done):
+        with mock.patch("subprocess.run", return_value=done), mock.patch.object(strata_engine, "stage_feed", return_value=None):
             return strata_engine.update_check({})
 
     def test_versions_are_compared_to_decide_whether_to_offer_an_upgrade(self):
@@ -74,8 +74,80 @@ class StrataUpdateCheckTests(unittest.TestCase):
         self.assertEqual(self.check("0.1.50")["engine_variant"], "cuda13")
 
     def test_unreadable_output_is_reported_not_raised(self):
-        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="")):
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="")), \
+                mock.patch.object(strata_engine, "stage_feed", return_value=None):
             self.assertIn("error", strata_engine.update_check({}))
+
+
+class StrataUpdateRetryTests(unittest.TestCase):
+    def run_update(self, outputs, cfg=None):
+        calls = []
+        def fake_popen(args, **kwargs):
+            out, rc = outputs[len(calls)]
+            calls.append(args[args.index("--feed") + 1])
+            return mock.Mock(stdout=iter([out]), wait=mock.Mock(return_value=rc))
+        with mock.patch("subprocess.Popen", side_effect=fake_popen), mock.patch("time.sleep"), \
+                mock.patch.object(strata_engine, "stage_feed", return_value=None):
+            rc = strata_engine.update(cfg or {}, say=lambda *_: None)
+        return rc, calls
+
+    def test_feed_read_errors_are_retried_then_succeed(self):
+        unreadable = ("strata: the update feed could not be read: SSL EOF\n", 1)
+        rc, calls = self.run_update([unreadable, ("Engine 0.1.51 is installed\n", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [strata_engine.FEED_URL] * 2)
+
+    def test_other_failures_are_not_retried(self):
+        rc, calls = self.run_update([("test start failed, kept 0.1.50\n", 3)])
+        self.assertEqual((rc, len(calls)), (3, 1))
+
+    def test_configured_github_mirror_is_tried_first(self):
+        cfg = {"download": {"github_mirror": "https://ghproxy.example/"}}
+        self.assertEqual(strata_engine.feed_urls(cfg)[:2],
+                         ["https://ghproxy.example/" + strata_engine.FEED_URL, strata_engine.FEED_URL])
+        # without one, GitHub first and the built-in mirror only as a fallback
+        urls = strata_engine.feed_urls({})
+        self.assertEqual(urls[0], strata_engine.FEED_URL)
+        self.assertEqual(urls[1:], [f"{m}/{strata_engine.FEED_URL}" for m in strata_engine.FALLBACK_MIRRORS])
+
+    def test_unreadable_feed_moves_on_to_the_next_address(self):
+        unreadable = ("strata: the update feed could not be read: SSL EOF\n", 1)
+        rc, calls = self.run_update([unreadable, unreadable, ("Engine 0.1.51 is installed\n", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [strata_engine.FEED_URL] * 2 + [strata_engine.feed_urls({})[1]])
+
+
+class StrataStagedFeedTests(unittest.TestCase):
+    PLAN = {"ok": True, "hardware": {"platform": "windows-x86_64"},
+            "engine": {"installed": {"version": "0.1.50"},
+                       "offered": {"version": "0.1.52", "url": "strata-engine-0.1.52-win.tar.gz", "sha256": "e" * 64}},
+            "control": {"installed": "0.1.51", "offered": "0.1.53"}}
+    FEED = {"control": {"packages": [{"platform": "linux-x86_64", "url": "c-linux.tar.gz", "sha256": "l" * 64},
+                                     {"platform": "windows-x86_64", "url": "c-win.zip", "sha256": "w" * 64}]}}
+
+    def stage(self, plan):
+        import json, tempfile
+        fetched = []
+        def fake_fetch(cfg, name, dest, sha256="", say=print):
+            fetched.append((name, sha256))
+            if name == "strata-feed.json":
+                dest.write_text(json.dumps(self.FEED), encoding="utf-8")
+            return True
+        with tempfile.TemporaryDirectory() as tmp,                 mock.patch.object(strata_engine, "FEED_DIR", Path(tmp)),                 mock.patch.object(strata_engine, "fetch_release_file", side_effect=fake_fetch),                 mock.patch.object(strata_engine, "_check", return_value=plan):
+            staged = strata_engine.stage_feed({}, packages=True, say=lambda *_: None)
+        return staged, fetched
+
+    def test_fetches_the_feed_signature_and_only_the_packages_this_pc_needs(self):
+        staged, fetched = self.stage(self.PLAN)
+        self.assertIsNotNone(staged)
+        self.assertEqual(fetched, [("strata-feed.json", ""), ("strata-feed.json.sig", ""),
+                                   ("strata-engine-0.1.52-win.tar.gz", "e" * 64), ("c-win.zip", "w" * 64)])
+
+    def test_nothing_to_download_when_current(self):
+        current = {**self.PLAN, "engine": {"installed": {"version": "0.1.52"}, "offered": {"version": "0.1.52", "url": "x"}},
+                   "control": {"installed": "0.1.53", "offered": "0.1.53"}}
+        _, fetched = self.stage(current)
+        self.assertEqual([n for n, _ in fetched], ["strata-feed.json", "strata-feed.json.sig"])
 
 
 class EngineSelectionTests(unittest.TestCase):

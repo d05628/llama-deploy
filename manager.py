@@ -1601,10 +1601,9 @@ class DeployManager:
             return {"status": "error", "message": "尚未安装 Strata：在配置里选 Strata 引擎并启动一次服务即可自动安装"}
         if read_server_mode().get("engine") == "strata" and self.get_server_status().get("server_running"):
             return {"status": "error", "message": "请先停止服务器，再升级 Strata"}
-        cfg = parse_jsonc(CONFIG_FILE) if CONFIG_FILE.exists() else default_config()
-        # Strata 先试启动新引擎，失败自动保留旧版本
-        return self._start_task(strata_engine.command("update"), "Strata 升级已启动",
-                                env=strata_engine.environment(cfg), cwd=strata_engine.CONTROL_DIR)
+        # Strata 先试启动新引擎，失败自动保留旧版本；读不到更新源（GitHub 断线）时自动重试
+        return self._start_task([sys.executable, str(BASE_DIR / "strata_engine.py"), "update"],
+                                "Strata 升级已启动")
 
     # ---------- 一键启动 agent（Claude Code / Codex / Gemini CLI） ----------
     agent_state = {"agent": "", "state": "idle", "message": ""}

@@ -68,15 +68,20 @@ def install(cfg: dict, say=print) -> None:
         return
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     archive = DOWNLOAD_DIR / CONTROL_ZIP
-    url = f"https://github.com/Niko1221/Strata/releases/download/{RELEASE}/{CONTROL_ZIP}"
-    mirror = str((cfg.get("download") or {}).get("github_mirror") or "").strip().rstrip("/")
-    if mirror:
-        url = f"{mirror}/{url}"
     if not archive.exists() or _sha256(archive) != CONTROL_SHA256:
         say(f"正在下载 Strata {RELEASE}（约 70MB）...")
         part = archive.with_suffix(".part")
-        with urllib.request.urlopen(url, timeout=120) as resp, open(part, "wb") as out:
-            shutil.copyfileobj(resp, out, 1 << 20)
+        url = f"https://github.com/Niko1221/Strata/releases/download/{RELEASE}/{CONTROL_ZIP}"
+        for candidate in github_urls(cfg, url):
+            try:
+                with urllib.request.urlopen(candidate, timeout=120) as resp, open(part, "wb") as out:
+                    shutil.copyfileobj(resp, out, 1 << 20)
+            except OSError as exc:
+                say(f"⚠️ 下载失败（{exc}），换下一个地址")
+                continue
+            if _sha256(part) == CONTROL_SHA256:
+                break
+            say("⚠️ 下载内容的 SHA-256 不符，换下一个地址")
         os.replace(part, archive)
     if _sha256(archive) != CONTROL_SHA256:
         archive.unlink(missing_ok=True)
@@ -147,15 +152,144 @@ def stop(cfg: dict, timeout: int = 240) -> str:
     return (r.stdout or r.stderr or "").strip()
 
 
+RELEASE_FILES = "https://github.com/Niko1221/Strata/releases/latest/download/"
+FEED_URL = RELEASE_FILES + "strata-feed.json"
+FEED_UNREADABLE = "update feed could not be read"
+FEED_DIR = BASE_DIR / "engines" / "strata-feed"
+
+
+# Used only for Strata, whose feed is signed and whose archive hash is pinned: GitHub drops TLS
+# connections from here for minutes at a time while gh-proxy keeps answering. llama.cpp downloads
+# are not hash-checked, so this list must not leak into download.github_mirror.
+FALLBACK_MIRRORS = ("https://gh-proxy.com",)
+
+
+def github_urls(cfg: dict, url: str) -> list:
+    """The configured mirror, GitHub itself, then the fallback mirrors."""
+    mirror = str((cfg.get("download") or {}).get("github_mirror") or "").strip().rstrip("/")
+    prefixes = ([mirror] if mirror else []) + [""] + list(FALLBACK_MIRRORS)
+    return list(dict.fromkeys(f"{m}/{url}" if m else url for m in prefixes))
+
+
+def feed_urls(cfg: dict) -> list:
+    return github_urls(cfg, FEED_URL)
+
+
+def _curl() -> str:
+    """curl.exe speaks TLS through Windows (Schannel). On some networks most handshakes from Python's
+    OpenSSL are cut off (SSL UNEXPECTED_EOF) while Schannel ones get through, and Strata downloads
+    with Python, so the release files are fetched with curl and handed to Strata as a local feed."""
+    system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    return shutil.which("curl") or (str(system) if system.exists() else "")
+
+
+def fetch_release_file(cfg: dict, name: str, dest: Path, sha256: str = "", say=print) -> bool:
+    curl = _curl()
+    if not curl:
+        return False
+    if sha256 and dest.exists() and _sha256(dest) == sha256:
+        return True
+    part = dest.with_name(dest.name + ".part")
+    for url in github_urls(cfg, RELEASE_FILES + name):
+        r = subprocess.run([curl, "-sSfL", "--retry", "5", "--retry-all-errors", "--retry-delay", "3",
+                            "--connect-timeout", "20", "-o", str(part), url],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            continue
+        if sha256 and _sha256(part) != sha256:
+            say(f"⚠️ {name} 的 SHA-256 与更新源不符，换下一个地址")
+            continue
+        os.replace(part, dest)
+        return True
+    part.unlink(missing_ok=True)
+    return False
+
+
+def _check(cfg: dict, source) -> dict:
+    r = subprocess.run(command("update", "--check", "--feed", source, "--output", "json"),
+                       env=environment(cfg), cwd=str(CONTROL_DIR), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=90)
+    return json.loads((r.stdout or "").strip().splitlines()[-1])
+
+
+def stage_feed(cfg: dict, packages: bool = False, say=print):
+    """Copy the signed feed into engines/strata-feed, and with packages=True the files the update needs.
+    Strata still verifies the signature and every hash itself. None when the files cannot be fetched."""
+    FEED_DIR.mkdir(parents=True, exist_ok=True)
+    for name in ("strata-feed.json", "strata-feed.json.sig"):
+        (FEED_DIR / name).unlink(missing_ok=True)  # never fall back to a stale copy
+        if not fetch_release_file(cfg, name, FEED_DIR / name, say=say):
+            return None
+    if not packages:
+        return FEED_DIR
+    try:
+        plan = _check(cfg, FEED_DIR)
+        feed = json.loads((FEED_DIR / "strata-feed.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not plan.get("ok", True):
+        return None
+    wanted = []
+    engine = plan.get("engine") or {}
+    offered, installed = engine.get("offered") or {}, engine.get("installed") or {}
+    if offered.get("url") and offered.get("version") != installed.get("version"):
+        wanted.append((offered["url"], offered.get("sha256", "")))
+    control = plan.get("control") or {}
+    if control.get("offered") and control.get("offered") != control.get("installed"):
+        platform = (plan.get("hardware") or {}).get("platform") or "windows-x86_64"
+        pkg = next((p for p in (feed.get("control") or {}).get("packages", []) if p.get("platform") == platform), None)
+        if pkg:
+            wanted.append((pkg["url"], pkg.get("sha256", "")))
+    for name, sha in wanted:
+        say(f"正在下载 {name} ...")
+        if not fetch_release_file(cfg, name, FEED_DIR / name, sha, say=say):
+            say(f"⚠️ 无法下载 {name}")
+            return None
+    return FEED_DIR
+
+
+def update(cfg: dict, attempts: int = 2, delay: float = 10, say=print) -> int:
+    """Run `strata update` from a local copy of the feed, falling back to Strata's own download, and retry
+    only when the feed could not be read (GitHub drops connections from here)."""
+    import time
+    rc = 1
+    staged = stage_feed(cfg, packages=True, say=say)
+    for url in ([str(staged)] if staged else []) + feed_urls(cfg):
+        for attempt in range(1, attempts + 1):
+            proc = subprocess.Popen(command("update", "--feed", url), env=environment(cfg), cwd=str(CONTROL_DIR),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace")
+            output = []
+            for line in proc.stdout:
+                output.append(line)
+                say(line.rstrip())
+            rc = proc.wait()
+            if rc == 0 and staged:
+                for leftover in list(FEED_DIR.glob("*.tar.gz")) + list(FEED_DIR.glob("*.zip")):
+                    leftover.unlink(missing_ok=True)  # installed now; do not keep ~600MB around
+            if rc == 0 or FEED_UNREADABLE not in "".join(output):
+                return rc
+            if attempt < attempts:
+                say(f"⚠️ 读取更新源时网络中断，{delay:.0f} 秒后重试（{attempt}/{attempts}）")
+                time.sleep(delay)
+        say(f"⚠️ 无法通过 {url} 读取更新源")
+    return rc
+
+
 def update_check(cfg: dict) -> dict:
     """Installed and offered engine / control versions from Strata's signed update feed."""
-    try:
-        r = subprocess.run(command("update", "--check", "--output", "json"), env=environment(cfg),
-                           cwd=str(CONTROL_DIR), capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=90)
-        data = json.loads((r.stdout or "").strip().splitlines()[-1])
-    except Exception as exc:
-        return {"error": f"无法读取 Strata 更新信息: {exc}"}
+    data = {"error": "无法读取 Strata 更新信息"}
+    staged = stage_feed(cfg)
+    for url in ([str(staged)] if staged else []) + feed_urls(cfg):
+        try:
+            data = _check(cfg, url)
+        except Exception as exc:
+            data = {"error": f"无法读取 Strata 更新信息: {exc}"}
+            continue
+        if data.get("ok", True):
+            break
+    if "error" in data and "engine" not in data:
+        return {"error": str(data["error"])}
     if not data.get("ok", True):
         return {"error": str(data.get("error") or "Strata 更新检查失败")}
     engine, control = data.get("engine") or {}, data.get("control") or {}
@@ -184,3 +318,13 @@ def launcher_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+if __name__ == "__main__":
+    # python strata_engine.py update  (the web manager's upgrade button runs this)
+    import sys
+    if sys.argv[1:] != ["update"]:
+        sys.exit("用法: python strata_engine.py update")
+    from run import CONFIG_FILE, parse_jsonc
+    sys.stdout.reconfigure(line_buffering=True, errors="replace")
+    sys.exit(update(parse_jsonc(CONFIG_FILE) or {}))
